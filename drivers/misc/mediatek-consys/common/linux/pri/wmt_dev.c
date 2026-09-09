@@ -54,6 +54,7 @@
 #include "stp_core.h"
 #include "stp_exp.h"
 #include "bgw_desense.h"
+#include <linux/suspend.h>
 #if WMT_CREATE_NODE_DYNAMIC
 #include <linux/device.h>
 #endif
@@ -215,7 +216,46 @@ struct early_suspend wmt_early_suspend_handler = {
 };
 
 #else
-UINT32 g_early_suspend_flag = 1;
+/*
+ * Android's early-suspend callback used this flag to select STP's quick
+ * power-save path only after the display/system entered suspend.  Mainline
+ * has no CONFIG_EARLYSUSPEND, so treating the missing callback as "already
+ * suspended" enables quick sleep permanently.  In that mode every non-WMT
+ * packet asks the combo firmware to sleep immediately, which can stall an
+ * active Bluetooth ACL stream when WLAN is not associated.
+ *
+ * Start in the awake state and mirror the old semantics with the standard PM
+ * notifier.  Ordinary runtime still uses STP's idle-timer power saving; quick
+ * sleep is reserved for a real system suspend or hibernation transition.
+ */
+UINT32 g_early_suspend_flag = 0;
+
+#ifdef CONFIG_PM_SLEEP
+static int wmt_dev_pm_notify(struct notifier_block *nb,
+			     unsigned long action, void *data)
+{
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
+	case PM_RESTORE_PREPARE:
+		g_early_suspend_flag = 1;
+		break;
+	case PM_POST_SUSPEND:
+	case PM_POST_HIBERNATION:
+	case PM_POST_RESTORE:
+		g_early_suspend_flag = 0;
+		break;
+	default:
+		break;
+	}
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block wmt_dev_pm_notifier = {
+	.notifier_call = wmt_dev_pm_notify,
+};
+#endif
 #endif
 
 MTK_WCN_BOOL wmt_dev_get_early_suspend_state(void)
@@ -2383,6 +2423,10 @@ static int WMT_init(void)
 #ifdef CONFIG_EARLYSUSPEND
     register_early_suspend(&wmt_early_suspend_handler);
     WMT_INFO_FUNC("register_early_suspend finished\n");
+#elif defined(CONFIG_PM_SLEEP)
+	ret = register_pm_notifier(&wmt_dev_pm_notifier);
+	if (ret)
+		WMT_WARN_FUNC("register_pm_notifier failed (%d)\n", ret);
 #endif
 
 	WMT_INFO_FUNC("success \n");
@@ -2424,6 +2468,8 @@ static void WMT_exit (void)
 #ifdef CONFIG_EARLYSUSPEND
     unregister_early_suspend(&wmt_early_suspend_handler);
     WMT_INFO_FUNC("unregister_early_suspend finished\n");
+#elif defined(CONFIG_PM_SLEEP)
+	unregister_pm_notifier(&wmt_dev_pm_notifier);
 #endif
 	
 #if CONSYS_WMT_REG_SUSPEND_CB_ENABLE
