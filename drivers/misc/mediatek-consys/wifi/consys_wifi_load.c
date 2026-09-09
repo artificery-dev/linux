@@ -26,6 +26,7 @@
 #include "osal.h"
 #include "wmt_exp.h"
 #include "consys_plat.h"
+#include "mtk_wcn_consys_hw.h"
 
 #define HIF_BASE		0x180f0000
 #define HIF_LEN			0x100
@@ -112,6 +113,7 @@ static void __iomem *hif;
 static u8 tx_credits;
 static u8 cmd_seq;
 static bool loaded;
+static bool wifi_paldo_on;
 /* The vendor builds with CFG_ENABLE_FW_DOWNLOAD_ACK and CFG_ENABLE_FW_ENCRYPTION,
  * i.e. ACK | ENCRYPTION_MODE. Tunable while this is being brought up. */
 static uint data_mode = DOWNLOAD_BUF_ACK_OPTION | DOWNLOAD_BUF_ENCRYPTION_MODE;
@@ -340,9 +342,24 @@ static int consys_wifi_probe(void)
 
 	if (!consys_plat.ready)
 		return -ENODEV;
+
+	/*
+	 * The vendor AHB bus probe enables VCN33_WIFI before entering
+	 * wlanAdapterStart().  WMT deliberately does not own this rail for WiFi
+	 * (unlike the Bluetooth PALDO), so omitting this step lets the RAM code
+	 * download successfully but makes its PHY initialization assert in
+	 * wifi/mgmt/mt6582/rlm_phy.c before WLAN_READY is raised.
+	 */
+	ret = mtk_wcn_consys_hw_wifi_paldo_ctrl(1);
+	if (ret)
+		return ret;
+	wifi_paldo_on = true;
+
 	hif = ioremap(HIF_BASE, HIF_LEN);
-	if (!hif)
-		return -ENOMEM;
+	if (!hif) {
+		ret = -ENOMEM;
+		goto out_power;
+	}
 	v = hif_rd(MCR_WCIR);
 	pr_info("consys-wifi: WCIR 0x%08x (chip 0x%04x rev %u), WHLPCR 0x%x\n",
 		v, v & 0xffff, (v >> 16) & 0xf, hif_rd(MCR_WHLPCR));
@@ -379,6 +396,11 @@ static int consys_wifi_probe(void)
 out:
 	iounmap(hif);
 	hif = NULL;
+out_power:
+	if (wifi_paldo_on) {
+		mtk_wcn_consys_hw_wifi_paldo_ctrl(0);
+		wifi_paldo_on = false;
+	}
 	return ret;
 }
 
@@ -387,6 +409,10 @@ static int consys_wifi_remove(void)
 	if (hif) {
 		iounmap(hif);
 		hif = NULL;
+	}
+	if (wifi_paldo_on) {
+		mtk_wcn_consys_hw_wifi_paldo_ctrl(0);
+		wifi_paldo_on = false;
 	}
 	loaded = false;
 	return 0;
