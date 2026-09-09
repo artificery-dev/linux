@@ -968,13 +968,22 @@ void mtk_dsi_ddp_quiesce(struct device *dev)
 {
 	struct mtk_dsi *dsi = dev_get_drvdata(dev);
 	u32 tmp;
+	int ret;
 
 	if (dsi->inherited_checked)
 		return;
+	ret = clk_prepare_enable(dsi->engine_clk);
+	if (ret)
+		return;
+	ret = clk_prepare_enable(dsi->digital_clk);
+	if (ret) {
+		clk_disable_unprepare(dsi->engine_clk);
+		return;
+	}
 	dsi->inherited_checked = true;
 
 	if (!(readl(dsi->regs + DSI_MODE_CTRL) & MODE))
-		return;
+		goto out;
 
 	writel(readl(dsi->regs + DSI_MODE_CTRL) & ~MODE,
 	       dsi->regs + DSI_MODE_CTRL);
@@ -983,6 +992,9 @@ void mtk_dsi_ddp_quiesce(struct device *dev)
 		dev_warn(dev, "inherited video mode did not idle\n");
 	else
 		dev_info(dev, "parked inherited video mode\n");
+out:
+	clk_disable_unprepare(dsi->digital_clk);
+	clk_disable_unprepare(dsi->engine_clk);
 }
 
 void mtk_dsi_ddp_stop(struct device *dev)
@@ -1316,8 +1328,24 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 	 * otherwise request_irq fires mtk_dsi_irq immediately and it spins on
 	 * DSI_BUSY forever. The driver re-enables INTEN in mtk_dsi_poweron.
 	 */
+	/* Direct DA boot does not inherit LK's enabled DSI clocks. Register
+	 * accesses with either gate closed can stall the interconnect.
+	 */
+	dev_info(dev, "enabling DSI probe clocks\n");
+	ret = clk_prepare_enable(dsi->engine_clk);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to enable DSI engine\n");
+	ret = clk_prepare_enable(dsi->digital_clk);
+	if (ret) {
+		clk_disable_unprepare(dsi->engine_clk);
+		return dev_err_probe(dev, ret, "Failed to enable DSI digital clock\n");
+	}
+	dev_info(dev, "clearing DSI interrupt state\n");
 	writel(0, dsi->regs + DSI_INTEN);
 	writel(readl(dsi->regs + DSI_INTSTA), dsi->regs + DSI_INTSTA);
+	clk_disable_unprepare(dsi->digital_clk);
+	clk_disable_unprepare(dsi->engine_clk);
+	dev_info(dev, "DSI interrupt state cleared\n");
 
 	init_waitqueue_head(&dsi->irq_wait_queue);
 
