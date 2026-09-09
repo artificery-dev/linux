@@ -1306,11 +1306,6 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 	if (irq_num < 0)
 		return irq_num;
 
-	dsi->host.ops = &mtk_dsi_ops;
-	dsi->host.dev = dev;
-	ret = mipi_dsi_host_register(&dsi->host);
-	if (ret < 0)
-		return dev_err_probe(dev, ret, "Failed to register DSI host\n");
 
 	/*
 	 * LK hands off with the DSI still running and its interrupt asserted.
@@ -1324,20 +1319,27 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 	writel(0, dsi->regs + DSI_INTEN);
 	writel(readl(dsi->regs + DSI_INTSTA), dsi->regs + DSI_INTSTA);
 
+	init_waitqueue_head(&dsi->irq_wait_queue);
+
 	ret = devm_request_irq(&pdev->dev, irq_num, mtk_dsi_irq,
 			       IRQF_TRIGGER_NONE, dev_name(&pdev->dev), dsi);
-	if (ret) {
-		mipi_dsi_host_unregister(&dsi->host);
+	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "Failed to request DSI irq\n");
-	}
-
-	init_waitqueue_head(&dsi->irq_wait_queue);
 
 	platform_set_drvdata(pdev, dsi);
 
 	dsi->bridge.funcs = &mtk_dsi_bridge_funcs;
 	dsi->bridge.of_node = dev->of_node;
 	dsi->bridge.type = DRM_MODE_CONNECTOR_DSI;
+
+	/* Registering the host can synchronously bind an already loaded panel
+	 * and the DRM aggregate. Publish fully initialized state first.
+	 */
+	dsi->host.ops = &mtk_dsi_ops;
+	dsi->host.dev = dev;
+	ret = mipi_dsi_host_register(&dsi->host);
+	if (ret < 0)
+		return dev_err_probe(dev, ret, "Failed to register DSI host\n");
 
 	return 0;
 }
