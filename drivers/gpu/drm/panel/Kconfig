@@ -790,6 +790,16 @@ config DRM_PANEL_SHARP_LS060T1SX01
 	  FullHD (1080x1920) DSI panel as found in Dragonboard Display Adapter
 	  Bundle.
 
+config DRM_PANEL_GC9503V
+	tristate "GalaxyCore GC9503V-based DSI panel (Innioasis Y2)"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	help
+	  Say Y here to enable support for the GalaxyCore GC9503V MIPI-DSI
+	  panel (gc9503v_hvga_dsi_vdo_hsd) as used on the Innioasis Y2,
+	  480x360 video mode, 2 data lanes.
+
 config DRM_PANEL_SITRONIX_ST7701
 	tristate "Sitronix ST7701 panel driver"
 	depends on OF
