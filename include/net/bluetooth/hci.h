@@ -338,6 +338,11 @@ enum {
 	 * during the hdev->setup vendor callback.
 	 */
 	HCI_QUIRK_FIXUP_LE_EXT_ADV_REPORT_PHY,
+
+	/* Apply the host ACL packet mask after every connection. Used when
+	 * controller-advertised packet types are unreliable on a board.
+	 */
+	HCI_QUIRK_FORCE_ACL_PTYPE,
 };
 
 /* HCI device flags */

@@ -3187,8 +3187,10 @@ static void hci_conn_complete_evt(struct hci_dev *hdev, void *data,
 			hci_update_scan(hdev);
 		}
 
-		/* Set packet type for incoming connection */
-		if (!conn->out && hdev->hci_ver < BLUETOOTH_VER_2_0) {
+		/* Some controllers require an explicit packet mask on all links. */
+		if ((!conn->out && hdev->hci_ver < BLUETOOTH_VER_2_0) ||
+		    (conn->type == ACL_LINK &&
+		     test_bit(HCI_QUIRK_FORCE_ACL_PTYPE, &hdev->quirks))) {
 			struct hci_cp_change_conn_ptype cp;
 			cp.handle = ev->handle;
 			cp.pkt_type = cpu_to_le16(conn->pkt_type);

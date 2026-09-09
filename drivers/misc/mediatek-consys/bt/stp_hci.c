@@ -200,6 +200,15 @@ static int stp_hci_post_init(struct hci_dev *hdev)
 	u8 events[8] = { 0 };
 	struct sk_buff *skb;
 
+	/* EDR stalls ACL completion credits on this board. Keep all Basic
+	 * Rate slot sizes; EDR packet bits are exclusions (1 = disabled).
+	 * Apply on every HCI open, before either side can create a link.
+	 */
+	hdev->pkt_type |= HCI_2DH1 | HCI_3DH1 | HCI_2DH3 | HCI_3DH3 |
+			  HCI_2DH5 | HCI_3DH5;
+	set_bit(HCI_QUIRK_FORCE_ACL_PTYPE, &hdev->quirks);
+	bt_dev_info(hdev, "Basic Rate ACL default (EDR diagnosis deferred)");
+
 	stp_hci_radio_cal(hdev);
 
 	if (hdev->commands[26] & 0x18)
