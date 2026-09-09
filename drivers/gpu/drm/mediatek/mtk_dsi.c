@@ -1283,6 +1283,9 @@ MODULE_PARM_DESC(bringup_trace, "Pace DSI probe diagnostics for USB capture");
 
 /* Recovery diagnostic: initialize and retain the PHY before probe MMIO. */
 static bool bringup_phy;
+static unsigned long bringup_rate;
+module_param(bringup_rate, ulong, 0444);
+MODULE_PARM_DESC(bringup_rate, "DSI link rate to set before early PHY power-on");
 module_param(bringup_phy, bool, 0444);
 MODULE_PARM_DESC(bringup_phy, "Initialize DSI PHY before probe register access");
 
@@ -1364,7 +1367,9 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 	if (bringup_phy) {
 		dev_info(dev, "powering DSI PHY before register access\n");
 		msleep(100);
-		ret = phy_power_on(dsi->phy);
+		ret = bringup_rate ? clk_set_rate(dsi->hs_clk, bringup_rate) : -EINVAL;
+		if (!ret)
+			ret = phy_power_on(dsi->phy);
 		if (ret) {
 			clk_disable_unprepare(dsi->digital_clk);
 			clk_disable_unprepare(dsi->engine_clk);
