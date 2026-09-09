@@ -18,6 +18,22 @@ config COMMON_CLK_MEDIATEK_FHCTL
 	  This driver supports MediaTek frequency hopping and
 	  spread spectrum clocking features.
 
+config COMMON_CLK_MT6582
+	bool "Clock driver for MediaTek MT6582"
+	depends on (ARCH_MEDIATEK && ARM) || COMPILE_TEST
+	select COMMON_CLK_MEDIATEK
+	default ARCH_MEDIATEK && ARM
+	help
+	  This driver supports MediaTek MT6582 apmixedsys, topckgen,
+	  infracfg and pericfg clocks.
+
+config COMMON_CLK_MT6582_MMSYS
+	bool "Clock driver for MediaTek MT6582 mmsys"
+	depends on COMMON_CLK_MT6582
+	default COMMON_CLK_MT6582
+	help
+	  This driver supports MediaTek MT6582 mmsys (display) clocks.
+
 config COMMON_CLK_MT2701
 	bool "Clock driver for MediaTek MT2701"
 	depends on (ARCH_MEDIATEK && ARM) || COMPILE_TEST
