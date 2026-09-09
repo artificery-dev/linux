@@ -319,6 +319,7 @@ static const struct mtk_ddp_comp_funcs ddp_dsc = {
 static const struct mtk_ddp_comp_funcs ddp_dsi = {
 	.start = mtk_dsi_ddp_start,
 	.stop = mtk_dsi_ddp_stop,
+	.quiesce = mtk_dsi_ddp_quiesce,
 	.encoder_index = mtk_dsi_encoder_index,
 };
 

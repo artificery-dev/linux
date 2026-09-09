@@ -89,10 +89,6 @@ struct mtk_gem_obj *mtk_gem_create(struct drm_device *dev,
 	if (alloc_kmap)
 		mtk_gem->kvaddr = mtk_gem->cookie;
 
-	DRM_DEBUG_DRIVER("cookie = %p dma_addr = %pad size = %zu\n",
-			 mtk_gem->cookie, &mtk_gem->dma_addr,
-			 size);
-
 	return mtk_gem;
 
 err_gem_free:
@@ -134,9 +130,18 @@ int mtk_gem_dumb_create(struct drm_file *file_priv, struct drm_device *dev,
 	args->size = args->pitch;
 	args->size *= args->height;
 
-	mtk_gem = mtk_gem_create(dev, args->size, false);
+	/*
+	 * alloc_kmap so the buffer can be zeroed: dumb buffers are scanned out
+	 * directly (fbdev, splash) and the arm32 dma_alloc_attrs path with
+	 * DMA_ATTR_NO_KERNEL_MAPPING hands back uncleared CMA pages - which
+	 * would flash as garbage between the first modeset and the first
+	 * client draw.  Dumb buffers are also supposed to be zeroed anyway.
+	 */
+	mtk_gem = mtk_gem_create(dev, args->size, true);
 	if (IS_ERR(mtk_gem))
 		return PTR_ERR(mtk_gem);
+
+	memset(mtk_gem->kvaddr, 0, args->size);
 
 	/*
 	 * allocate a id of idr table where the obj is registered

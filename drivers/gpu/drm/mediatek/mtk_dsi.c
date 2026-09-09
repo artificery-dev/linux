@@ -8,6 +8,8 @@
 #include <linux/component.h>
 #include <linux/iopoll.h>
 #include <linux/irq.h>
+#include <linux/delay.h>
+#include <linux/io.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/phy/phy.h>
@@ -191,6 +193,7 @@ struct mtk_dsi_driver_data {
 	bool has_size_ctl;
 	bool cmdq_long_packet_ctl;
 	bool support_per_frame_lp;
+	bool conservative_phy_timing;
 };
 
 struct mtk_dsi {
@@ -217,6 +220,7 @@ struct mtk_dsi {
 	struct mtk_phy_timing phy_timing;
 	int refcount;
 	bool enabled;
+	bool inherited_checked;
 	bool lanes_ready;
 	u32 irq_data;
 	wait_queue_head_t irq_wait_queue;
@@ -263,6 +267,31 @@ static void mtk_dsi_phy_timconfig(struct mtk_dsi *dsi)
 	timing->clk_hs_zero = (330 * data_rate_mhz / (8 * 1000)) + 1 -
 			      timing->clk_hs_prepare;
 	timing->clk_hs_exit = (118 * data_rate_mhz / (8 * 1000)) + 1;
+
+	/*
+	 * Old SoCs (mt6582) need the vendor's far more conservative D-PHY
+	 * timings.  The formulas above (tuned on mt8173-era PHYs) produce
+	 * HS_TRAIL/CLK_TRAIL of ~5 cycles at this data rate, which ends each
+	 * HS burst so abruptly that the panel corrupts the final bytes of
+	 * every line packet - visible as a wrong-coloured rightmost pixel
+	 * column.  These values match what the vendor LK programs at the same
+	 * lane rate (verified against live hardware).
+	 */
+	if (dsi->driver_data->conservative_phy_timing) {
+		timing->lpx = 3;
+		timing->da_hs_prepare = 3;
+		timing->da_hs_zero = 6;
+		timing->da_hs_trail = 14;
+		timing->ta_go = 12;
+		timing->ta_sure = 4;
+		timing->ta_get = 15;
+		timing->da_hs_exit = 18;
+		timing->clk_hs_prepare = 2;
+		timing->clk_hs_post = 18;
+		timing->clk_hs_trail = 14;
+		timing->clk_hs_zero = 16;
+		timing->clk_hs_exit = 6;
+	}
 
 	timcon0 = FIELD_PREP(LPX, timing->lpx) |
 		  FIELD_PREP(HS_PREP, timing->da_hs_prepare) |
@@ -680,6 +709,7 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 	if (++dsi->refcount != 1)
 		return 0;
 
+
 	ret = mipi_dsi_pixel_format_to_bpp(dsi->format);
 	if (ret < 0) {
 		dev_err(dev, "Unknown MIPI DSI format %d\n", dsi->format);
@@ -696,12 +726,17 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 		goto err_refcount;
 	}
 
-	phy_power_on(dsi->phy);
-
+	/*
+	 * MT6582: enable the DSI engine + digital clocks BEFORE powering on the
+	 * mipi-tx PLL. The vendor DSI_PowerOn does clocks-then-PHY, and on this
+	 * SoC the post-PLL_EN mipi-tx register access (PLL_TOP) stalls the bus if
+	 * the DSI clocks are not already running. (Mainline's default order is
+	 * phy-then-clocks, which hangs here.)
+	 */
 	ret = clk_prepare_enable(dsi->engine_clk);
 	if (ret < 0) {
 		dev_err(dev, "Failed to enable engine clock: %d\n", ret);
-		goto err_phy_power_off;
+		goto err_refcount;
 	}
 
 	ret = clk_prepare_enable(dsi->digital_clk);
@@ -710,6 +745,8 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 		goto err_disable_engine_clk;
 	}
 
+	phy_power_on(dsi->phy);
+
 	mtk_dsi_enable(dsi);
 
 	if (dsi->driver_data->has_shadow_ctl)
@@ -717,6 +754,16 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 		       dsi->regs + DSI_SHADOW_DEBUG);
 
 	mtk_dsi_reset_engine(dsi);
+
+	/*
+	 * LK hands off with DSI_MODE_CTRL still in video mode. Force cmd mode
+	 * now so the panel's init DCS writes go out as command transfers -
+	 * otherwise mtk_dsi_host_transfer sees MODE!=0, tries a video->cmd
+	 * switch and waits for a VM_DONE that never comes (video was never
+	 * started under Linux) -> panel init times out. mtk_dsi_set_mode()
+	 * switches to video later in mtk_output_dsi_enable().
+	 */
+	mtk_dsi_set_cmd_mode(dsi);
 	mtk_dsi_phy_timconfig(dsi);
 
 	mtk_dsi_ps_control(dsi, true);
@@ -898,6 +945,44 @@ void mtk_dsi_ddp_start(struct device *dev)
 	struct mtk_dsi *dsi = dev_get_drvdata(dev);
 
 	mtk_dsi_poweron(dsi);
+}
+
+/*
+ * Park the video mode the bootloader left free-running, at a frame boundary.
+ *
+ * The LK bootloader hands over a live OVL->RDMA->COLOR->BLS->DSI pipeline
+ * scanning its boot logo.  We deliberately leave it running - the logo keeps
+ * refreshing with zero decay - until the first real modeset takes the
+ * hardware.  At that moment this hook runs, before any DDP engine is stopped
+ * or reconfigured: clearing MODE makes the VM engine finish the frame in
+ * flight and go idle, which in turn lets the upstream engines complete that
+ * frame and idle cleanly, still armed on a SOF that never comes.  Stopping or
+ * resetting any engine with frames in flight instead wedges the SOF-latched
+ * pipeline: the consumer stalls mid-line, upstream freezes mid-frame, and
+ * with no further SOF pulses nothing ever latches again.
+ *
+ * Runs at most once: on later crtc enables the DSI clocks may be gated, and
+ * touching the registers then would stall the bus.
+ */
+void mtk_dsi_ddp_quiesce(struct device *dev)
+{
+	struct mtk_dsi *dsi = dev_get_drvdata(dev);
+	u32 tmp;
+
+	if (dsi->inherited_checked)
+		return;
+	dsi->inherited_checked = true;
+
+	if (!(readl(dsi->regs + DSI_MODE_CTRL) & MODE))
+		return;
+
+	writel(readl(dsi->regs + DSI_MODE_CTRL) & ~MODE,
+	       dsi->regs + DSI_MODE_CTRL);
+	if (readl_poll_timeout(dsi->regs + DSI_INTSTA, tmp, !(tmp & DSI_BUSY),
+			       1000, 100000))
+		dev_warn(dev, "inherited video mode did not idle\n");
+	else
+		dev_info(dev, "parked inherited video mode\n");
 }
 
 void mtk_dsi_ddp_stop(struct device *dev)
@@ -1227,6 +1312,18 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "Failed to register DSI host\n");
 
+	/*
+	 * LK hands off with the DSI still running and its interrupt asserted.
+	 * The video mode itself is deliberately left running - see
+	 * mtk_dsi_ddp_quiesce(), which parks it at the first real modeset.
+	 * Disable interrupt generation (INTEN) and clear pending status (INTSTA)
+	 * so the shared IRQ line is deasserted before we install the handler -
+	 * otherwise request_irq fires mtk_dsi_irq immediately and it spins on
+	 * DSI_BUSY forever. The driver re-enables INTEN in mtk_dsi_poweron.
+	 */
+	writel(0, dsi->regs + DSI_INTEN);
+	writel(readl(dsi->regs + DSI_INTSTA), dsi->regs + DSI_INTSTA);
+
 	ret = devm_request_irq(&pdev->dev, irq_num, mtk_dsi_irq,
 			       IRQF_TRIGGER_NONE, dev_name(&pdev->dev), dsi);
 	if (ret) {
@@ -1261,6 +1358,11 @@ static const struct mtk_dsi_driver_data mt2701_dsi_driver_data = {
 	.reg_cmdq_off = 0x180,
 };
 
+static const struct mtk_dsi_driver_data mt6582_dsi_driver_data = {
+	.reg_cmdq_off = 0x180,
+	.conservative_phy_timing = true,
+};
+
 static const struct mtk_dsi_driver_data mt8183_dsi_driver_data = {
 	.reg_cmdq_off = 0x200,
 	.has_shadow_ctl = true,
@@ -1283,6 +1385,7 @@ static const struct mtk_dsi_driver_data mt8188_dsi_driver_data = {
 
 static const struct of_device_id mtk_dsi_of_match[] = {
 	{ .compatible = "mediatek,mt2701-dsi", .data = &mt2701_dsi_driver_data },
+	{ .compatible = "mediatek,mt6582-dsi", .data = &mt6582_dsi_driver_data },
 	{ .compatible = "mediatek,mt8173-dsi", .data = &mt8173_dsi_driver_data },
 	{ .compatible = "mediatek,mt8183-dsi", .data = &mt8183_dsi_driver_data },
 	{ .compatible = "mediatek,mt8186-dsi", .data = &mt8186_dsi_driver_data },

@@ -58,6 +58,7 @@ struct mtk_ddp_comp_funcs {
 		       unsigned int bpc, struct cmdq_pkt *cmdq_pkt);
 	void (*start)(struct device *dev);
 	void (*stop)(struct device *dev);
+	void (*quiesce)(struct device *dev);
 	void (*register_vblank_cb)(struct device *dev,
 				   void (*vblank_cb)(void *),
 				   void *vblank_cb_data);
@@ -158,6 +159,18 @@ static inline void mtk_ddp_comp_stop(struct mtk_ddp_comp *comp)
 {
 	if (comp->funcs && comp->funcs->stop)
 		comp->funcs->stop(comp->dev);
+}
+
+/*
+ * Ask a component to gracefully park any operation a bootloader left
+ * running, before the pipeline it belongs to is stopped or reconfigured.
+ * Currently implemented by the DSI, which stops inherited video mode at a
+ * frame boundary.
+ */
+static inline void mtk_ddp_comp_quiesce(struct mtk_ddp_comp *comp)
+{
+	if (comp->funcs && comp->funcs->quiesce)
+		comp->funcs->quiesce(comp->dev);
 }
 
 static inline void mtk_ddp_comp_register_vblank_cb(struct mtk_ddp_comp *comp,

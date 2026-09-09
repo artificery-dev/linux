@@ -388,6 +388,26 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
 		mtk_mutex_add_comp(mtk_crtc->mutex, mtk_crtc->ddp_comp[i]->id);
 	mtk_mutex_enable(mtk_crtc->mutex);
 
+	/*
+	 * Quiesce whatever scanout the bootloader left running before
+	 * reconfiguring anything.  On mt6582 the LK bootloader hands over a
+	 * live OVL->RDMA->COLOR->BLS->DSI video pipeline (still scanning the
+	 * boot logo at this point - we leave it running on purpose so the
+	 * panel content never decays before the first real modeset).
+	 * Reconfiguring or resetting engines with frames in flight wedges the
+	 * SOF-latched shadow-register DDP (an engine frozen mid-frame never
+	 * sees another SOF once its consumer stalls).  So: first park the
+	 * output at a frame boundary (consumer-first - upstream engines then
+	 * complete the frame and idle cleanly), then stop the now-idle
+	 * engines so the config/reset/start below runs like a cold boot.
+	 * The output comp itself is excluded from the stop loop: it is the
+	 * timing source, not a latched engine, and its comp stop callback
+	 * maps to mtk_dsi_poweroff() which must stay balanced with poweron.
+	 */
+	mtk_ddp_comp_quiesce(mtk_crtc->ddp_comp[mtk_crtc->ddp_comp_nr - 1]);
+	for (i = 0; i < mtk_crtc->ddp_comp_nr - 1; i++)
+		mtk_ddp_comp_stop(mtk_crtc->ddp_comp[i]);
+
 	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
 		struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[i];
 
@@ -955,6 +975,7 @@ int mtk_crtc_create(struct drm_device *drm_dev, const unsigned int *path,
 
 	if (!path)
 		return 0;
+
 
 	priv = priv->all_drm_private[priv_data_index];
 

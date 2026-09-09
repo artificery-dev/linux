@@ -15,7 +15,7 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_drv.h>
-#include <drm/drm_fbdev_dma.h>
+#include <drm/drm_fbdev_ttm.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_framebuffer_helper.h>
@@ -69,6 +69,20 @@ static const unsigned int mt2701_mtk_ddp_main[] = {
 static const unsigned int mt2701_mtk_ddp_ext[] = {
 	DDP_COMPONENT_RDMA1,
 	DDP_COMPONENT_DPI0,
+};
+
+/*
+ * mt6582 main path matched to the vendor LK, which drives OVL0->RDMA0->COLOR0->
+ * DSI0 with the display mutex MOD = OVL0|COLOR0|RDMA0 (0x488, NO BLS). BLS on
+ * mt6582 is only the backlight/PWM (disp-pwm), not a DDP data-path component;
+ * including it as a dummy comp adds bit9 to the mutex MOD (0x688) and puts an
+ * unbacked node in the path. Drop it so the pipeline matches LK exactly.
+ */
+static const unsigned int mt6582_mtk_ddp_main[] = {
+	DDP_COMPONENT_OVL0,
+	DDP_COMPONENT_RDMA0,
+	DDP_COMPONENT_COLOR0,
+	DDP_COMPONENT_DSI0,
 };
 
 static const unsigned int mt7623_mtk_ddp_main[] = {
@@ -239,6 +253,13 @@ static const struct mtk_mmsys_driver_data mt2701_mmsys_driver_data = {
 	.mmsys_dev_num = 1,
 };
 
+static const struct mtk_mmsys_driver_data mt6582_mmsys_driver_data = {
+	.main_path = mt6582_mtk_ddp_main,
+	.main_len = ARRAY_SIZE(mt6582_mtk_ddp_main),
+	.shadow_register = true,
+	.mmsys_dev_num = 1,
+};
+
 static const struct mtk_mmsys_driver_data mt7623_mmsys_driver_data = {
 	.main_path = mt7623_mtk_ddp_main,
 	.main_len = ARRAY_SIZE(mt7623_mtk_ddp_main),
@@ -329,6 +350,8 @@ static const struct mtk_mmsys_driver_data mt8195_vdosys1_driver_data = {
 static const struct of_device_id mtk_drm_of_ids[] = {
 	{ .compatible = "mediatek,mt2701-mmsys",
 	  .data = &mt2701_mmsys_driver_data},
+	{ .compatible = "mediatek,mt6582-mmsys",
+	  .data = &mt6582_mmsys_driver_data},
 	{ .compatible = "mediatek,mt7623-mmsys",
 	  .data = &mt7623_mmsys_driver_data},
 	{ .compatible = "mediatek,mt2712-mmsys",
@@ -662,7 +685,33 @@ static int mtk_drm_bind(struct device *dev)
 	if (ret < 0)
 		goto err_deinit;
 
-	drm_fbdev_dma_setup(drm, 32);
+	/*
+	 * Probe every connector once so status and mode lists are valid before
+	 * the first client looks.  With fbdev emulation disabled nothing else
+	 * performs the initial probe (the fbdev client used to), and DRM boot
+	 * splashes such as plymouth skip connectors still reporting "unknown".
+	 */
+	{
+		struct drm_connector_list_iter conn_iter;
+		struct drm_connector *connector;
+
+		mutex_lock(&drm->mode_config.mutex);
+		drm_connector_list_iter_begin(drm, &conn_iter);
+		drm_for_each_connector_iter(connector, &conn_iter)
+			connector->funcs->fill_modes(connector,
+						     drm->mode_config.max_width,
+						     drm->mode_config.max_height);
+		drm_connector_list_iter_end(&conn_iter);
+		mutex_unlock(&drm->mode_config.mutex);
+	}
+
+	/*
+	 * 16bpp: RGB565 is the native format of this pipeline (panel, LK, and
+	 * OVL all run 565).  The first modeset this triggers performs the
+	 * takeover from the still-running LK scanout - see
+	 * mtk_ddp_comp_quiesce() in mtk_crtc_ddp_hw_init().
+	 */
+	drm_fbdev_ttm_setup(drm, 16);
 
 	return 0;
 
@@ -711,6 +760,8 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
 	  .data = (void *)MTK_DISP_CCORR },
 	{ .compatible = "mediatek,mt2701-disp-color",
 	  .data = (void *)MTK_DISP_COLOR },
+	{ .compatible = "mediatek,mt6582-disp-color",
+	  .data = (void *)MTK_DISP_COLOR },
 	{ .compatible = "mediatek,mt8167-disp-color",
 	  .data = (void *)MTK_DISP_COLOR },
 	{ .compatible = "mediatek,mt8173-disp-color",
@@ -733,6 +784,8 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
 	  .data = (void *)MTK_DISP_MERGE },
 	{ .compatible = "mediatek,mt2701-disp-mutex",
 	  .data = (void *)MTK_DISP_MUTEX },
+	{ .compatible = "mediatek,mt6582-disp-mutex",
+	  .data = (void *)MTK_DISP_MUTEX },
 	{ .compatible = "mediatek,mt2712-disp-mutex",
 	  .data = (void *)MTK_DISP_MUTEX },
 	{ .compatible = "mediatek,mt8167-disp-mutex",
@@ -752,6 +805,8 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
 	{ .compatible = "mediatek,mt8173-disp-od",
 	  .data = (void *)MTK_DISP_OD },
 	{ .compatible = "mediatek,mt2701-disp-ovl",
+	  .data = (void *)MTK_DISP_OVL },
+	{ .compatible = "mediatek,mt6582-disp-ovl",
 	  .data = (void *)MTK_DISP_OVL },
 	{ .compatible = "mediatek,mt8167-disp-ovl",
 	  .data = (void *)MTK_DISP_OVL },
@@ -776,6 +831,8 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
 	{ .compatible = "mediatek,mt8173-disp-pwm",
 	  .data = (void *)MTK_DISP_PWM },
 	{ .compatible = "mediatek,mt2701-disp-rdma",
+	  .data = (void *)MTK_DISP_RDMA },
+	{ .compatible = "mediatek,mt6582-disp-rdma",
 	  .data = (void *)MTK_DISP_RDMA },
 	{ .compatible = "mediatek,mt8167-disp-rdma",
 	  .data = (void *)MTK_DISP_RDMA },
@@ -806,6 +863,8 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
 	{ .compatible = "mediatek,mt8195-dp-intf",
 	  .data = (void *)MTK_DP_INTF },
 	{ .compatible = "mediatek,mt2701-dsi",
+	  .data = (void *)MTK_DSI },
+	{ .compatible = "mediatek,mt6582-dsi",
 	  .data = (void *)MTK_DSI },
 	{ .compatible = "mediatek,mt8173-dsi",
 	  .data = (void *)MTK_DSI },

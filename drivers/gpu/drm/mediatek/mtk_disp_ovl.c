@@ -42,6 +42,9 @@
 #define DISP_REG_OVL_RDMA_CTRL(n)		(0x00c0 + 0x20 * (n))
 #define DISP_REG_OVL_RDMA_GMC(n)		(0x00c8 + 0x20 * (n))
 #define DISP_REG_OVL_ADDR_MT2701		0x0040
+/* mt2701/mt6582-layout CLRFMT codes (see mtk_ovl_fmt_convert) */
+#define OVL_CON_CLRFMT_PARGB8888_MT2701	(3 << 12)
+#define OVL_CON_CLRFMT_XRGB8888_MT2701	(4 << 12)
 #define DISP_REG_OVL_CLRFMT_EXT			0x02d0
 #define OVL_CON_CLRFMT_BIT_DEPTH_MASK(n)		(GENMASK(1, 0) << (4 * (n)))
 #define OVL_CON_CLRFMT_BIT_DEPTH(depth, n)		((depth) << (4 * (n)))
@@ -100,6 +103,22 @@ static inline bool is_10bit_rgb(u32 fmt)
 	}
 	return false;
 }
+
+/*
+ * The mt2701/mt6582-generation OVL: no RGBA-ordered codes (alpha/X leads or
+ * it doesn't exist), no 10-bit, and its YUV codes (YUYV=8, UYVY=9) collide
+ * with the newer layout's numbering (left out until someone needs them).
+ */
+static const u32 mt2701_formats[] = {
+	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_XBGR8888,
+	DRM_FORMAT_ABGR8888,
+	DRM_FORMAT_RGB888,
+	DRM_FORMAT_BGR888,
+	DRM_FORMAT_RGB565,
+	DRM_FORMAT_BGR565,
+};
 
 static const u32 mt8173_formats[] = {
 	DRM_FORMAT_XRGB8888,
@@ -320,6 +339,16 @@ void mtk_ovl_config(struct device *dev, unsigned int w,
 	mtk_ddp_write_relaxed(cmdq_pkt, OVL_COLOR_ALPHA, &ovl->cmdq_reg,
 			      ovl->regs, DISP_REG_OVL_ROI_BGCLR);
 
+	/*
+	 * Never soft-reset a running OVL: on SOF-latched (shadow register)
+	 * pipelines like mt6582 the video-mode DSI free-runs and an OVL reset
+	 * mid-frame starves it mid-line, after which no new SOF ever arrives
+	 * and the whole path deadlocks.  The vendor driver likewise skips
+	 * OVLStop()/OVLReset() when reconfiguring a live DSI-video path.
+	 */
+	if (!cmdq_pkt && readl(ovl->regs + DISP_REG_OVL_EN) & 0x1)
+		return;
+
 	mtk_ddp_write(cmdq_pkt, 0x1, &ovl->cmdq_reg, ovl->regs, DISP_REG_OVL_RST);
 	mtk_ddp_write(cmdq_pkt, 0x0, &ovl->cmdq_reg, ovl->regs, DISP_REG_OVL_RST);
 }
@@ -377,6 +406,10 @@ void mtk_ovl_layer_on(struct device *dev, unsigned int idx,
 	else
 		gmc_value = gmc_thrshd_l | gmc_thrshd_l << 8 |
 			    gmc_thrshd_h << 16 | gmc_thrshd_h << 24;
+	/* Y2/mt6582: vendor LK programs OVL_RDMA_GMC = 0x10101010 for the layer
+	 * memory-fetch thresholds. The mt2701 gmc_bits=8 computation gives
+	 * 0x40402020, which over-drives the smaller mt6582 OVL FIFO. Match LK. */
+	gmc_value = 0x10101010;
 	mtk_ddp_write(cmdq_pkt, gmc_value,
 		      &ovl->cmdq_reg, ovl->regs, DISP_REG_OVL_RDMA_GMC(idx));
 	mtk_ddp_write_mask(cmdq_pkt, BIT(idx), &ovl->cmdq_reg, ovl->regs,
@@ -414,6 +447,36 @@ static unsigned int mtk_ovl_fmt_convert(struct mtk_disp_ovl *ovl,
 	 */
 	if (ovl->data->blend_modes & BIT(DRM_MODE_BLEND_PREMULTI))
 		blend_mode = state->base.pixel_blend_mode;
+
+	/*
+	 * The mt2701/mt6582-generation OVL speaks a different CLRFMT table:
+	 * RGB888=0, RGB565=1, ARGB8888=2, PARGB8888=3, xRGB8888=4. Notably
+	 * xRGB8888 is its own hardware format whose alpha byte is ignored -
+	 * this generation has no CONST_BLD bit in the pitch register, so
+	 * mapping X-formats to ARGB8888 (the newer layout's trick) honours a
+	 * garbage alpha byte and blends the layer invisible. The 565/888
+	 * codes line up with the fmt_rgb565_is_0=false quirk already; only
+	 * the 8888 family needs its own answers here.
+	 */
+	if (ovl->data->addr == DISP_REG_OVL_ADDR_MT2701) {
+		switch (fmt) {
+		case DRM_FORMAT_XRGB8888:
+			return OVL_CON_CLRFMT_XRGB8888_MT2701;
+		case DRM_FORMAT_XBGR8888:
+			return OVL_CON_CLRFMT_XRGB8888_MT2701 |
+			       OVL_CON_BYTE_SWAP;
+		case DRM_FORMAT_ARGB8888:
+			return blend_mode == DRM_MODE_BLEND_PREMULTI ?
+			       OVL_CON_CLRFMT_PARGB8888_MT2701 :
+			       OVL_CON_CLRFMT_ARGB8888;
+		case DRM_FORMAT_ABGR8888:
+			return (blend_mode == DRM_MODE_BLEND_PREMULTI ?
+				OVL_CON_CLRFMT_PARGB8888_MT2701 :
+				OVL_CON_CLRFMT_ARGB8888) | OVL_CON_BYTE_SWAP;
+		default:
+			break;
+		}
+	}
 
 	switch (fmt) {
 	default:
@@ -508,8 +571,14 @@ void mtk_ovl_layer_config(struct device *dev, unsigned int idx,
 		 * for XRGB format, otherwise OVL will still read the value from memory.
 		 * For RGB888 related formats, whether CONST_BLD is enabled or not won't
 		 * affect the result. Therefore we use !has_alpha as the condition.
+		 *
+		 * The mt2701/mt6582 layout has no CONST_BLD bit - X-formats map
+		 * to the hardware's own xRGB code there (see mtk_ovl_fmt_convert)
+		 * and the pitch register carries nothing but the pitch.
 		 */
-		if (blend_mode == DRM_MODE_BLEND_PIXEL_NONE || !state->base.fb->format->has_alpha)
+		if ((blend_mode == DRM_MODE_BLEND_PIXEL_NONE ||
+		     !state->base.fb->format->has_alpha) &&
+		    ovl->data->addr != DISP_REG_OVL_ADDR_MT2701)
 			ignore_pixel_alpha = OVL_CONST_BLEND;
 	}
 
@@ -537,18 +606,30 @@ void mtk_ovl_layer_config(struct device *dev, unsigned int idx,
 	mtk_ddp_write_relaxed(cmdq_pkt, addr, &ovl->cmdq_reg, ovl->regs,
 			      DISP_REG_OVL_ADDR(ovl, idx));
 
-	if (is_afbc) {
-		mtk_ddp_write_relaxed(cmdq_pkt, hdr_addr, &ovl->cmdq_reg, ovl->regs,
-				      DISP_REG_OVL_HDR_ADDR(ovl, idx));
-		mtk_ddp_write_relaxed(cmdq_pkt,
-				      OVL_PITCH_MSB_2ND_SUBBUF | overlay_pitch.split_pitch.msb,
-				      &ovl->cmdq_reg, ovl->regs, DISP_REG_OVL_PITCH_MSB(idx));
-		mtk_ddp_write_relaxed(cmdq_pkt, hdr_pitch, &ovl->cmdq_reg, ovl->regs,
-				      DISP_REG_OVL_HDR_PITCH(ovl, idx));
-	} else {
-		mtk_ddp_write_relaxed(cmdq_pkt,
-				      overlay_pitch.split_pitch.msb,
-				      &ovl->cmdq_reg, ovl->regs, DISP_REG_OVL_PITCH_MSB(idx));
+	/*
+	 * On the mt2701/mt6582 register layout the layer address register sits
+	 * at 0x0040 + 0x20 * n -- the same offset PITCH_MSB occupies on newer
+	 * SoCs.  Writing PITCH_MSB there would clobber the just-programmed
+	 * address with (usually) zero, sending the OVL fetch engine to an
+	 * unbacked AXI address and wedging the whole display path.  Only touch
+	 * PITCH_MSB/HDR regs on SoCs whose layout actually has them.
+	 */
+	if (ovl->data->addr != DISP_REG_OVL_ADDR_MT2701) {
+		if (is_afbc) {
+			mtk_ddp_write_relaxed(cmdq_pkt, hdr_addr, &ovl->cmdq_reg,
+					      ovl->regs,
+					      DISP_REG_OVL_HDR_ADDR(ovl, idx));
+			mtk_ddp_write_relaxed(cmdq_pkt,
+					      OVL_PITCH_MSB_2ND_SUBBUF | overlay_pitch.split_pitch.msb,
+					      &ovl->cmdq_reg, ovl->regs, DISP_REG_OVL_PITCH_MSB(idx));
+			mtk_ddp_write_relaxed(cmdq_pkt, hdr_pitch, &ovl->cmdq_reg,
+					      ovl->regs,
+					      DISP_REG_OVL_HDR_PITCH(ovl, idx));
+		} else {
+			mtk_ddp_write_relaxed(cmdq_pkt,
+					      overlay_pitch.split_pitch.msb,
+					      &ovl->cmdq_reg, ovl->regs, DISP_REG_OVL_PITCH_MSB(idx));
+		}
 	}
 
 	mtk_ovl_set_bit_depth(dev, idx, fmt, cmdq_pkt);
@@ -653,8 +734,8 @@ static const struct mtk_disp_ovl_data mt2701_ovl_driver_data = {
 	.gmc_bits = 8,
 	.layer_nr = 4,
 	.fmt_rgb565_is_0 = false,
-	.formats = mt8173_formats,
-	.num_formats = ARRAY_SIZE(mt8173_formats),
+	.formats = mt2701_formats,
+	.num_formats = ARRAY_SIZE(mt2701_formats),
 };
 
 static const struct mtk_disp_ovl_data mt8173_ovl_driver_data = {
@@ -727,6 +808,8 @@ static const struct mtk_disp_ovl_data mt8195_ovl_driver_data = {
 
 static const struct of_device_id mtk_disp_ovl_driver_dt_match[] = {
 	{ .compatible = "mediatek,mt2701-disp-ovl",
+	  .data = &mt2701_ovl_driver_data},
+	{ .compatible = "mediatek,mt6582-disp-ovl",
 	  .data = &mt2701_ovl_driver_data},
 	{ .compatible = "mediatek,mt8173-disp-ovl",
 	  .data = &mt8173_ovl_driver_data},

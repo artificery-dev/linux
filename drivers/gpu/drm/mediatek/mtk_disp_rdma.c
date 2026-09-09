@@ -7,6 +7,7 @@
 
 #include <linux/clk.h>
 #include <linux/component.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -29,6 +30,9 @@
 #define DISP_REG_RDMA_GLOBAL_CON		0x0010
 #define RDMA_ENGINE_EN					BIT(0)
 #define RDMA_MODE_MEMORY				BIT(1)
+#define RDMA_SOFT_RESET					BIT(4)
+#define RDMA_FSM_STATE					GENMASK(10, 8)
+#define RDMA_FSM_STATE_IDLE				(0x1 << 8)
 #define DISP_REG_RDMA_SIZE_CON_0		0x0014
 #define RDMA_MATRIX_ENABLE				BIT(17)
 #define RDMA_MATRIX_INT_MTX_SEL				GENMASK(23, 20)
@@ -178,7 +182,24 @@ void mtk_rdma_start(struct device *dev)
 
 void mtk_rdma_stop(struct device *dev)
 {
+	struct mtk_disp_rdma *rdma = dev_get_drvdata(dev);
+	u32 tmp;
+
 	rdma_update_bits(dev, DISP_REG_RDMA_GLOBAL_CON, RDMA_ENGINE_EN, 0);
+
+	/*
+	 * Soft-reset the engine as well: an RDMA stopped mid-frame (e.g. when
+	 * quiescing scanout inherited from the bootloader) keeps its FSM stuck
+	 * and will not restart cleanly on the next enable.  FSM state lives in
+	 * GLOBAL_CON[10:8], 0x1 = idle.
+	 */
+	rdma_update_bits(dev, DISP_REG_RDMA_GLOBAL_CON, RDMA_SOFT_RESET,
+			 RDMA_SOFT_RESET);
+	rdma_update_bits(dev, DISP_REG_RDMA_GLOBAL_CON, RDMA_SOFT_RESET, 0);
+	if (readl_poll_timeout_atomic(rdma->regs + DISP_REG_RDMA_GLOBAL_CON,
+				      tmp, (tmp & RDMA_FSM_STATE) == RDMA_FSM_STATE_IDLE,
+				      10, 10000))
+		dev_warn(dev, "rdma not idle after soft reset (0x%08x)\n", tmp);
 }
 
 void mtk_rdma_config(struct device *dev, unsigned int width,
@@ -210,6 +231,11 @@ void mtk_rdma_config(struct device *dev, unsigned int width,
 	reg = RDMA_FIFO_UNDERFLOW_EN |
 	      RDMA_FIFO_PSEUDO_SIZE(rdma_fifo_size) |
 	      RDMA_OUTPUT_VALID_FIFO_THRESHOLD(threshold);
+	/* Y2/mt6582: the vendor LK programs RDMA_FIFO_CON = 0x01000010 (no
+	 * underflow-en, pseudo size 0x01000000, output threshold 0x10). The
+	 * mt2701-derived computation gives 0x810000b3 which does not match the
+	 * mt6582 RDMA FIFO and corrupts the OVL->DSI stream. Match LK exactly. */
+	reg = 0x01000010;
 	mtk_ddp_write(cmdq_pkt, reg, &rdma->cmdq_reg, rdma->regs, DISP_REG_RDMA_FIFO_CON);
 }
 
@@ -404,6 +430,8 @@ static const struct mtk_disp_rdma_data mt8195_rdma_driver_data = {
 
 static const struct of_device_id mtk_disp_rdma_driver_dt_match[] = {
 	{ .compatible = "mediatek,mt2701-disp-rdma",
+	  .data = &mt2701_rdma_driver_data},
+	{ .compatible = "mediatek,mt6582-disp-rdma",
 	  .data = &mt2701_rdma_driver_data},
 	{ .compatible = "mediatek,mt8173-disp-rdma",
 	  .data = &mt8173_rdma_driver_data},

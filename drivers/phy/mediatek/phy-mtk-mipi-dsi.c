@@ -5,6 +5,23 @@
 
 #include "phy-mtk-mipi-dsi.h"
 
+#include <linux/io.h>
+#include <linux/delay.h>
+/* Y2 DISP debug: paint the LK framebuffer a colour (survives bus-hang). */
+static inline void y2_fbmark(u16 color)
+{
+	void __iomem *fb = ioremap(0xbfb54600, 480 * 368 * 2);
+	int i;
+
+	if (fb) {
+		for (i = 0; i < 480 * 368; i++)
+			writew(color, fb + i * 2);
+		iounmap(fb);
+	}
+	mdelay(400);
+}
+
+
 inline struct mtk_mipi_tx *mtk_mipi_tx_from_clk_hw(struct clk_hw *hw)
 {
 	return container_of(hw, struct mtk_mipi_tx, pll_hw);
@@ -182,6 +199,7 @@ static int mtk_mipi_tx_probe(struct platform_device *pdev)
 static const struct of_device_id mtk_mipi_tx_match[] = {
 	{ .compatible = "mediatek,mt2701-mipi-tx", .data = &mt2701_mipitx_data },
 	{ .compatible = "mediatek,mt8173-mipi-tx", .data = &mt8173_mipitx_data },
+	{ .compatible = "mediatek,mt6582-mipi-tx", .data = &mt8173_mipitx_data },
 	{ .compatible = "mediatek,mt8183-mipi-tx", .data = &mt8183_mipitx_data },
 	{ /* sentinel */ }
 };

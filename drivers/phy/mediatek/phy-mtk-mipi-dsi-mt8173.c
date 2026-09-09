@@ -5,6 +5,20 @@
  */
 
 #include "phy-mtk-io.h"
+
+#include <linux/io.h>
+#include <linux/delay.h>
+static inline void y2_fbmark(u16 color)
+{
+	void __iomem *fb = ioremap(0xbfb54600, 480 * 368 * 2);
+	int i;
+	if (fb) {
+		for (i = 0; i < 480 * 368; i++)
+			writew(color, fb + i * 2);
+		iounmap(fb);
+	}
+	mdelay(400);
+}
 #include "phy-mtk-mipi-dsi.h"
 
 #define MIPITX_DSI_CON		0x00
@@ -123,38 +137,28 @@ static int mtk_mipi_tx_pll_prepare(struct clk_hw *hw)
 {
 	struct mtk_mipi_tx *mipi_tx = mtk_mipi_tx_from_clk_hw(hw);
 	void __iomem *base = mipi_tx->regs;
-	u8 txdiv, txdiv0, txdiv1;
-	u64 pcw;
+	u32 reg;
 
-	dev_dbg(mipi_tx->dev, "prepare: %u Hz\n", mipi_tx->data_rate);
+	/*
+	 * MT6582 mipi-tx PLL bring-up, following the vendor DSI_PHY_clk_setting
+	 * (references/vendor-src/mt6582-dsi/dsi_drv.c). Differences from mt8173
+	 * that matter on this SoC:
+	 *  - the clock/data lane LDOs are enabled BEFORE PLL_EN and the PLL_TOP
+	 *    access; doing them afterwards (mt8173 order) leaves PLL_TOP dead on
+	 *    the bus;
+	 *  - the SDM is powered with isolation, then de-isolated;
+	 *  - PRESERVE_L=3 gives the /4 post-divide;
+	 *  - fixed TXDIV0=1/TXDIV1=0 and integer PCW_H=52 (fbk_div 13<<2), the
+	 *    LCM PLL_CLOCK=0 path that LK uses for this panel.
+	 */
 
-	if (mipi_tx->data_rate >= 500000000) {
-		txdiv = 1;
-		txdiv0 = 0;
-		txdiv1 = 0;
-	} else if (mipi_tx->data_rate >= 250000000) {
-		txdiv = 2;
-		txdiv0 = 1;
-		txdiv1 = 0;
-	} else if (mipi_tx->data_rate >= 125000000) {
-		txdiv = 4;
-		txdiv0 = 2;
-		txdiv1 = 0;
-	} else if (mipi_tx->data_rate > 62000000) {
-		txdiv = 8;
-		txdiv0 = 2;
-		txdiv1 = 1;
-	} else if (mipi_tx->data_rate >= 50000000) {
-		txdiv = 16;
-		txdiv0 = 2;
-		txdiv1 = 2;
-	} else {
-		return -EINVAL;
-	}
-
+	/* bias + core/clk LDO */
+	mtk_phy_update_bits(base + MIPITX_DSI_TOP_CON,
+			    RG_DSI_LNT_IMP_CAL_CODE | RG_DSI_LNT_HS_BIAS_EN,
+			    FIELD_PREP(RG_DSI_LNT_IMP_CAL_CODE, 8) |
+			    RG_DSI_LNT_HS_BIAS_EN);
 	mtk_phy_update_bits(base + MIPITX_DSI_BG_CON,
-			    RG_DSI_VOUT_MSK | RG_DSI_BG_CKEN |
-			    RG_DSI_BG_CORE_EN,
+			    RG_DSI_VOUT_MSK | RG_DSI_BG_CKEN | RG_DSI_BG_CORE_EN,
 			    FIELD_PREP(RG_DSI_V02_SEL, 4) |
 			    FIELD_PREP(RG_DSI_V032_SEL, 4) |
 			    FIELD_PREP(RG_DSI_V04_SEL, 4) |
@@ -162,51 +166,42 @@ static int mtk_mipi_tx_pll_prepare(struct clk_hw *hw)
 			    FIELD_PREP(RG_DSI_V10_SEL, 4) |
 			    FIELD_PREP(RG_DSI_V12_SEL, 4) |
 			    RG_DSI_BG_CKEN | RG_DSI_BG_CORE_EN);
-
-	usleep_range(30, 100);
-
-	mtk_phy_update_bits(base + MIPITX_DSI_TOP_CON,
-			    RG_DSI_LNT_IMP_CAL_CODE | RG_DSI_LNT_HS_BIAS_EN,
-			    FIELD_PREP(RG_DSI_LNT_IMP_CAL_CODE, 8) |
-			    RG_DSI_LNT_HS_BIAS_EN);
-
+	mdelay(10);
 	mtk_phy_set_bits(base + MIPITX_DSI_CON,
 			 RG_DSI_CKG_LDOOUT_EN | RG_DSI_LDOCORE_EN);
 
+	/* SDM power: PWR_ON with ISO, settle, then de-isolate */
 	mtk_phy_update_bits(base + MIPITX_DSI_PLL_PWR,
 			    RG_DSI_MPPLL_SDM_PWR_ON | RG_DSI_MPPLL_SDM_ISO_EN,
-			    RG_DSI_MPPLL_SDM_PWR_ON);
+			    RG_DSI_MPPLL_SDM_PWR_ON | RG_DSI_MPPLL_SDM_ISO_EN);
+	mdelay(10);
+	mtk_phy_clear_bits(base + MIPITX_DSI_PLL_PWR, RG_DSI_MPPLL_SDM_ISO_EN);
 
+	/* PLL dividers: PREDIV=0, POSDIV=0, TXDIV0=1, TXDIV1=0 */
 	mtk_phy_clear_bits(base + MIPITX_DSI_PLL_CON0, RG_DSI_MPPLL_PLL_EN);
-
 	mtk_phy_update_bits(base + MIPITX_DSI_PLL_CON0,
-			    RG_DSI_MPPLL_TXDIV0 | RG_DSI_MPPLL_TXDIV1 |
-			    RG_DSI_MPPLL_PREDIV,
-			    FIELD_PREP(RG_DSI_MPPLL_TXDIV0, txdiv0) |
-			    FIELD_PREP(RG_DSI_MPPLL_TXDIV1, txdiv1));
+			    RG_DSI_MPPLL_PREDIV | RG_DSI_MPPLL_POSDIV |
+			    RG_DSI_MPPLL_TXDIV0 | RG_DSI_MPPLL_TXDIV1,
+			    FIELD_PREP(RG_DSI_MPPLL_TXDIV0, 1));
 
-	/*
-	 * PLL PCW config
-	 * PCW bit 24~30 = integer part of pcw
-	 * PCW bit 0~23 = fractional part of pcw
-	 * pcw = data_Rate*4*txdiv/(Ref_clk*2);
-	 * Post DIV =4, so need data_Rate*4
-	 * Ref_clk is 26MHz
-	 */
-	pcw = div_u64(((u64)mipi_tx->data_rate * 2 * txdiv) << 24, 26000000);
-	writel(pcw, base + MIPITX_DSI_PLL_CON2);
-
+	/* PCW: integer PCW_H (bits 24..30) = fbk_div(13) << 2 = 52, no fraction */
+	writel(52u << 24, base + MIPITX_DSI_PLL_CON2);
 	mtk_phy_set_bits(base + MIPITX_DSI_PLL_CON1, RG_DSI_MPPLL_SDM_FRA_EN);
 
+	/* Enable clock + data lane LDOs BEFORE PLL_EN (vendor order). */
+	for (reg = MIPITX_DSI_CLOCK_LANE; reg <= MIPITX_DSI_DATA_LANE3; reg += 4)
+		mtk_phy_set_bits(base + reg, RG_DSI_LNTx_LDOOUT_EN);
+
+	/* Enable the PLL */
 	mtk_phy_set_bits(base + MIPITX_DSI_PLL_CON0, RG_DSI_MPPLL_PLL_EN);
-
-	usleep_range(20, 100);
-
+	mdelay(1);
 	mtk_phy_clear_bits(base + MIPITX_DSI_PLL_CON1, RG_DSI_MPPLL_SDM_SSC_EN);
 
-	mtk_phy_update_field(base + MIPITX_DSI_PLL_TOP,
-			     RG_DSI_MPPLL_PRESERVE,
-			     mipi_tx->driver_data->mppll_preserve);
+	/* PRESERVE_L=3 => /4 post-divide (blind write; RMW-read of 0x64 stalls) */
+	writel(FIELD_PREP(RG_DSI_MPPLL_PRESERVE, 3), base + MIPITX_DSI_PLL_TOP);
+
+	/* release the DSI pad */
+	mtk_phy_clear_bits(base + MIPITX_DSI_TOP_CON, RG_DSI_PAD_TIE_LOW_EN);
 
 	return 0;
 }
