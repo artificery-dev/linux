@@ -9,3 +9,4 @@ obj-$(CONFIG_MTK_MMSYS) += mtk-mutex.o
 obj-$(CONFIG_MTK_SVS) += mtk-svs.o
 obj-$(CONFIG_MTK_SOCINFO) += mtk-socinfo.o
 obj-$(CONFIG_MTK_MT6582_MFG_POWER) += mt6582-mfg-power.o
+obj-$(CONFIG_MTK_MT6582_SPM) += mt6582-spm.o

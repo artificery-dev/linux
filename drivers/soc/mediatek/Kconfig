@@ -88,4 +88,15 @@ config MTK_MT6582_MFG_POWER
 	  the on-SoC Mali-400 MP2. There is no full MT6582 SCPSYS/clock driver;
 	  the clock source is left as the bootloader configured it.
 
+config MTK_MT6582_SPM
+	bool "MediaTek MT6582 system power manager"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	help
+	  Bring up the MT6582 system power manager (SPM) and run the vendor
+	  normal-mode PCM program. The normal program services the always-on
+	  source-clock and thermal handshakes used by SoC subsystems. Suspend
+	  and deep-idle modes are not implemented yet.
+
+	  If unsure, say N.
+
 endmenu
