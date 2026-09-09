@@ -166,7 +166,8 @@ static void mtk_pmic_keys_lp_reset_setup(struct mtk_pmic_keys *keys,
 
 	switch (long_press_mode) {
 	case LP_TWOKEY:
-		value |= kregs_home->rst_en_mask;
+		if (kregs_home)
+			value |= kregs_home->rst_en_mask;
 		fallthrough;
 
 	case LP_ONEKEY:
@@ -174,7 +175,8 @@ static void mtk_pmic_keys_lp_reset_setup(struct mtk_pmic_keys *keys,
 		fallthrough;
 
 	case LP_DISABLE:
-		mask |= kregs_home->rst_en_mask;
+		if (kregs_home)
+			mask |= kregs_home->rst_en_mask;
 		mask |= kregs_pwr->rst_en_mask;
 		break;
 
