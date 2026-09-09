@@ -4,7 +4,7 @@ menu "MediaTek pinctrl drivers"
 
 config EINT_MTK
 	tristate "MediaTek External Interrupt Support"
-	depends on PINCTRL_MTK || PINCTRL_MTK_MOORE || PINCTRL_MTK_PARIS || COMPILE_TEST
+	depends on PINCTRL_MTK || PINCTRL_MTK_MOORE || PINCTRL_MTK_PARIS || ARCH_MEDIATEK || COMPILE_TEST
 	select GPIOLIB
 	select IRQ_DOMAIN
 	default y if PINCTRL_MTK || PINCTRL_MTK_MOORE

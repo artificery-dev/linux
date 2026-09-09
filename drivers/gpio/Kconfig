@@ -485,6 +485,17 @@ config GPIO_MT7621
 	help
 	  Say yes here to support the Mediatek MT7621 SoC GPIO device.
 
+config GPIO_MT6582
+	tristate "MediaTek MT6582 GPIO + EINT support"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	depends on OF_GPIO
+	depends on EINT_MTK
+	help
+	  Say yes here to support the GPIO controller and external-interrupt
+	  (EINT) block on the MediaTek MT6582 SoC. The EINT half reuses the
+	  shared mtk-eint irqchip library and provides wakeup-capable
+	  interrupts (used by the click-wheel buttons and data-ready line).
+
 config GPIO_MVEBU
 	def_bool y
 	depends on PLAT_ORION || ARCH_MVEBU
