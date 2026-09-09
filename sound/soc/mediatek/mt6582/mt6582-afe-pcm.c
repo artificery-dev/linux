@@ -12,6 +12,7 @@
  */
 
 #include <linux/delay.h>
+#include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -32,10 +33,182 @@ static const unsigned int mt6582_afe_backup_list[] = {
 	AFE_I2S_CON3,
 	FPGA_CFG1,
 	AFE_DAC_CON0,
+	AFE_I2S_CON,
+	AFE_CONN4,
+	AFE_GAIN2_CON0,
+	AFE_GAIN2_CON1,
+	AFE_GAIN2_CON2,
+	AFE_GAIN2_CON3,
+	AFE_GAIN2_CONN,
+	AFE_ASRC_CON0,
+	AFE_ASRC_CON13,
+	AFE_ASRC_CON14,
+	AFE_ASRC_CON15,
+	AFE_ASRC_CON16,
+	AFE_ASRC_CON17,
+	AFE_ASRC_CON20,
+	AFE_ASRC_CON21,
 };
 
 struct mt6582_afe_private {
 	struct clk *clocks[MT6582_CLK_NUM];
+	struct mutex fm_lock;
+	bool fm_playback;
+};
+
+/*
+ * The stock MT6582 Audio HAL sends the MT6627's 32 kHz master-mode I2S
+ * stream through the AFE ASRC and gain2 block to the same O00/O01 pair used
+ * by normal playback.  Keep this as an explicit mixer control: userspace can
+ * hold an ordinary silent 48 kHz playback stream to power/configure the
+ * CS43131 while this direct, zero-copy path supplies the samples.
+ */
+static int mt6582_afe_fm_enable(struct mtk_base_afe *afe)
+{
+	int ret;
+
+	ret = regmap_update_bits(afe->regmap, AFE_GAIN2_CONN,
+				 AFE_GAIN2_CONN_FM, AFE_GAIN2_CONN_FM);
+	if (ret)
+		return ret;
+
+	/* Gain mode first, exactly as AudioFMResourceManager does. */
+	ret = regmap_write(afe->regmap, AFE_GAIN2_CON0,
+			   AFE_GAIN2_CON0_FM_MODE);
+	if (ret)
+		return ret;
+
+	/* 2nd I2S input: CONSYS pad, FM provides clocks, 16-bit I2S. */
+	ret = regmap_update_bits(afe->regmap, AFE_I2S_CON,
+				 (u32)~AFE_I2S_CON_EN,
+				 BIT(31) | AFE_I2S_CON_SLAVE |
+				 AFE_I2S_CON_FORMAT_I2S);
+	if (ret)
+		return ret;
+	ret = regmap_update_bits(afe->regmap, FPGA_CFG1, BIT(8), 0);
+	if (ret)
+		return ret;
+
+	/* 32 kHz FM input -> the active 48 kHz CS43131 output. */
+	ret = regmap_update_bits(afe->regmap, AFE_CONN4, BIT(30), 0);
+	if (ret)
+		return ret;
+	ret = regmap_update_bits(afe->regmap, AFE_ASRC_CON13, BIT(16), 0);
+	if (ret)
+		return ret;
+	ret = regmap_write(afe->regmap, AFE_ASRC_CON14, 0x00600000);
+	if (ret)
+		return ret;
+	ret = regmap_write(afe->regmap, AFE_ASRC_CON15, 0x00400000);
+	if (ret)
+		return ret;
+	ret = regmap_write(afe->regmap, AFE_ASRC_CON17, 0x00000cb2);
+	if (ret)
+		return ret;
+	ret = regmap_write(afe->regmap, AFE_ASRC_CON16, 0x00075987);
+	if (ret)
+		return ret;
+	ret = regmap_write(afe->regmap, AFE_ASRC_CON20, 0x00001b00);
+	if (ret)
+		return ret;
+
+	/* Slew up from silence rather than exposing ASRC start-up garbage. */
+	ret = regmap_write(afe->regmap, AFE_GAIN2_CUR, 0);
+	if (ret)
+		return ret;
+	ret = regmap_write(afe->regmap, AFE_GAIN2_CON1, AFE_GAIN2_UNITY);
+	if (ret)
+		return ret;
+	ret = regmap_update_bits(afe->regmap, AFE_GAIN2_CON0,
+				 AFE_GAIN2_CON0_EN, AFE_GAIN2_CON0_EN);
+	if (ret)
+		return ret;
+	ret = regmap_update_bits(afe->regmap, AFE_DAC_CON0,
+				 AFE_DAC_CON0_AFE_ON_RETM,
+				 AFE_DAC_CON0_AFE_ON_RETM);
+	if (ret)
+		return ret;
+	ret = regmap_update_bits(afe->regmap, AFE_ASRC_CON0,
+				 AFE_ASRC_CON0_EN |
+				 AFE_ASRC_CON0_COEFF_RELOAD,
+				 AFE_ASRC_CON0_EN |
+				 AFE_ASRC_CON0_COEFF_RELOAD);
+	if (ret)
+		return ret;
+
+	return regmap_update_bits(afe->regmap, AFE_I2S_CON,
+				  AFE_I2S_CON_EN, AFE_I2S_CON_EN);
+}
+
+static void mt6582_afe_fm_disable(struct mtk_base_afe *afe)
+{
+	/* Give the hardware gain ramp a moment to start slewing toward silence. */
+	regmap_write(afe->regmap, AFE_GAIN2_CON1, 0);
+	usleep_range(1000, 1500);
+	regmap_update_bits(afe->regmap, AFE_GAIN2_CON0,
+			   AFE_GAIN2_CON0_EN, 0);
+	regmap_update_bits(afe->regmap, AFE_GAIN2_CONN,
+			   AFE_GAIN2_CONN_FM, 0);
+	regmap_update_bits(afe->regmap, AFE_ASRC_CON0,
+			   AFE_ASRC_CON0_EN | AFE_ASRC_CON0_COEFF_RELOAD, 0);
+	regmap_update_bits(afe->regmap, AFE_I2S_CON, AFE_I2S_CON_EN, 0);
+	regmap_update_bits(afe->regmap, AFE_CONN4, BIT(30), BIT(30));
+	regmap_update_bits(afe->regmap, AFE_DAC_CON0,
+			   AFE_DAC_CON0_AFE_ON_RETM, 0);
+}
+
+static int mt6582_afe_fm_get(struct snd_kcontrol *kcontrol,
+			     struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component =
+		snd_soc_kcontrol_component(kcontrol);
+	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
+	struct mt6582_afe_private *afe_priv = afe->platform_priv;
+
+	ucontrol->value.integer.value[0] = afe_priv->fm_playback;
+	return 0;
+}
+
+static int mt6582_afe_fm_put(struct snd_kcontrol *kcontrol,
+			     struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component =
+		snd_soc_kcontrol_component(kcontrol);
+	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
+	struct mt6582_afe_private *afe_priv = afe->platform_priv;
+	bool enable = !!ucontrol->value.integer.value[0];
+	int ret = 0;
+
+	mutex_lock(&afe_priv->fm_lock);
+	if (enable == afe_priv->fm_playback)
+		goto out;
+
+	if (enable) {
+		ret = pm_runtime_resume_and_get(afe->dev);
+		if (ret < 0)
+			goto out;
+		ret = mt6582_afe_fm_enable(afe);
+		if (ret) {
+			mt6582_afe_fm_disable(afe);
+			pm_runtime_put(afe->dev);
+			goto out;
+		}
+		afe_priv->fm_playback = true;
+	} else {
+		mt6582_afe_fm_disable(afe);
+		afe_priv->fm_playback = false;
+		pm_runtime_put(afe->dev);
+	}
+	ret = 1;
+
+out:
+	mutex_unlock(&afe_priv->fm_lock);
+	return ret;
+}
+
+static const struct snd_kcontrol_new mt6582_afe_controls[] = {
+	SOC_SINGLE_BOOL_EXT("FM Playback Switch", 0,
+			    mt6582_afe_fm_get, mt6582_afe_fm_put),
 };
 
 static const struct snd_pcm_hardware mt6582_afe_hardware = {
@@ -205,6 +378,8 @@ static const struct snd_soc_dapm_route mt6582_afe_pcm_routes[] = {
 
 static const struct snd_soc_component_driver mt6582_afe_pcm_dai_component = {
 	.name = "mt6582-afe-pcm-dai",
+	.controls = mt6582_afe_controls,
+	.num_controls = ARRAY_SIZE(mt6582_afe_controls),
 	.dapm_routes = mt6582_afe_pcm_routes,
 	.num_dapm_routes = ARRAY_SIZE(mt6582_afe_pcm_routes),
 	.suspend = mtk_afe_suspend,
@@ -388,6 +563,7 @@ static int mt6582_afe_pcm_dev_probe(struct platform_device *pdev)
 	afe_priv = afe->platform_priv;
 	if (!afe_priv)
 		return -ENOMEM;
+	mutex_init(&afe_priv->fm_lock);
 
 	afe->dev = &pdev->dev;
 

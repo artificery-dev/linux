@@ -76,7 +76,19 @@ enum {
 #define AFE_MEMIF_MINLEN	0x03d0
 #define AFE_MEMIF_MAXLEN	0x03d4
 #define AFE_MEMIF_PBUF_SIZE	0x03d8
+#define AFE_GAIN2_CON0		0x0428
+#define AFE_GAIN2_CON1		0x042c
+#define AFE_GAIN2_CON2		0x0430
+#define AFE_GAIN2_CON3		0x0434
+#define AFE_GAIN2_CONN		0x0438
+#define AFE_GAIN2_CUR		0x043c
 #define AFE_ASRC_CON0		0x0500
+#define AFE_ASRC_CON13		0x0550
+#define AFE_ASRC_CON14		0x0554
+#define AFE_ASRC_CON15		0x0558
+#define AFE_ASRC_CON16		0x055c
+#define AFE_ASRC_CON17		0x0560
+#define AFE_ASRC_CON20		0x056c
 #define AFE_ASRC_CON21		0x0570
 #define PCM_INTF_CON1		0x0530
 
@@ -102,6 +114,7 @@ enum {
 #define AFE_DAC_CON0_AFE_ON		BIT(0)
 #define AFE_DAC_CON0_DL1_ON		BIT(1)
 #define AFE_DAC_CON0_I2S_ON		BIT(5)
+#define AFE_DAC_CON0_AFE_ON_RETM	BIT(12)
 
 /*
  * AFE_I2S_CON3: the "2nd I2S out", the one whose pads leave the SoC (on the
@@ -118,6 +131,23 @@ enum {
 /* AFE_CONN0: DL1 (I05/I06) into the 2nd I2S out (O00/O01) */
 #define AFE_CONN0_I05_O00		BIT(5)
 #define AFE_CONN0_I06_O01		BIT(22)
+
+/*
+ * MT6627 FM direct path, recovered from the shipping Audio HAL:
+ * I00/I01 (CONSYS 2nd-I2S input) -> O15/O16 (ASRC), then
+ * I12/I13 (ASRC output) -> O00/O01 (external DAC).  All four switches live
+ * in AFE_GAIN2_CONN on this generation.
+ */
+#define AFE_GAIN2_CONN_FM		0x00810005
+
+/* AFE_GAIN2_CON0: 48 kHz ramp clock, 64-step slew, enable. */
+#define AFE_GAIN2_CON0_FM_MODE		0x000040a0
+#define AFE_GAIN2_CON0_EN		BIT(0)
+#define AFE_GAIN2_UNITY			0x00080000
+
+/* AFE_ASRC_CON0: enable and one-shot coefficient reload. */
+#define AFE_ASRC_CON0_EN			BIT(0)
+#define AFE_ASRC_CON0_COEFF_RELOAD	BIT(6)
 
 /* FPGA_CFG1: the stock HAL sets bit 4 with the 2nd I2S out, clears it for ADDA */
 #define FPGA_CFG1			0x04c4
