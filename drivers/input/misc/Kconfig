@@ -956,4 +956,13 @@ config INPUT_STPMIC1_ONKEY
 	  To compile this driver as a module, choose M here: the
 	  module will be called stpmic1_onkey.
 
+config INPUT_APT32F_WHEEL
+	tristate "Innioasis Y2 APT32F click-wheel scroll"
+	depends on I2C && OF
+	help
+	  Say Y to enable wheel rotation/scroll for the APT32F click-wheel
+	  controller on the Innioasis Y2 (i2c). The wheel's nav buttons are
+	  handled separately by gpio-keys; this driver reports the rotation
+	  as scroll key events, read on the controller's data-ready interrupt.
+
 endif
