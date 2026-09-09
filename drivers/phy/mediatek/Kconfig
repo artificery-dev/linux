@@ -97,3 +97,12 @@ config PHY_MTK_DP
 	select GENERIC_PHY
 	help
 	  Support DisplayPort PHY for MediaTek SoCs.
+
+config PHY_MTK_U2_MT6582
+	tristate "MediaTek MT6582 USB2 PHY Driver"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	depends on OF
+	select GENERIC_PHY
+	help
+	  USB 2.0 PHY driver for the MediaTek MT6582 (device-mode bring-up),
+	  consumed by the musb "mediatek,mtk-musb" glue.
