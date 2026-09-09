@@ -34,6 +34,29 @@ config SND_SOC_MT2701_WM8960
 	  Select Y if you have such device.
 	  If unsure select "N".
 
+config SND_SOC_MT6582
+	tristate "ASoC support for Mediatek MT6582 chip"
+	depends on ARCH_MEDIATEK
+	select SND_SOC_MEDIATEK
+	help
+	  This adds ASoC platform driver support for the Mediatek MT6582
+	  audio front end (the MT8135-generation AFE) that can be used with
+	  an external I2S codec.
+	  Select Y if you have such device.
+	  If unsure select "N".
+
+config SND_SOC_MT6582_CS43131
+	tristate "ASoC Audio driver for MT6582 with CS43131 codec"
+	depends on SND_SOC_MT6582 && I2C
+	select SND_SOC_CS43130
+	select SND_SOC_AW87559
+	help
+	  This adds ASoC driver for the Innioasis Y2 (MT6582) with the
+	  Cirrus CS43131 DAC on the AFE's I2S output and an Awinic AW87559
+	  speaker amplifier.
+	  Select Y if you have such device.
+	  If unsure select "N".
+
 config SND_SOC_MT6797
 	tristate "ASoC support for Mediatek MT6797 chip"
 	depends on ARCH_MEDIATEK

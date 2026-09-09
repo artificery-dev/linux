@@ -659,6 +659,14 @@ config SND_SOC_AW88395_LIB
 	select CRC8
 	tristate
 
+config SND_SOC_AW87559
+	tristate "Awinic AW87559 Audio Amplifier"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Enable support for the Awinic AW87559 class-D audio amplifier,
+	  configured over I2C.
+
 config SND_SOC_AW88395
 	tristate "Soc Audio for awinic aw88395"
 	depends on I2C
