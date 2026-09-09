@@ -30,6 +30,7 @@
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
 #include <linux/workqueue.h>
+#include "mt6323-charge-policy.h"
 
 /* CHR_CON0 */
 #define RG_CSDAC_EN		BIT(3)
@@ -96,7 +97,12 @@
 
 /* Maintenance worker period. Must be < the 4s charge-watchdog timeout so the
  * worker's pet keeps it from firing and cutting CHR_EN. */
-#define CHG_MAINT_MS		3000
+#define CHG_MAINT_MS		2000
+
+/* Opt-in recovery policy, ported from hyptrace's tested charge gate. */
+static bool recovery_1a;
+module_param(recovery_1a, bool, 0444);
+MODULE_PARM_DESC(recovery_1a, "Recovery: promote 450mA to 1A after healthy checks");
 
 struct mt6323_charger {
 	struct device *dev;
@@ -104,6 +110,8 @@ struct mt6323_charger {
 	struct power_supply *psy;
 	struct power_supply *batt;
 	struct delayed_work maint;
+	unsigned int healthy_checks;
+	bool input_present;
 };
 
 /* One AUXADC conversion. Returns the 15-bit raw sample or a negative errno. */
@@ -261,25 +269,36 @@ static void mt6323_charger_maint_work(struct work_struct *work)
 	struct mt6323_charger *chg =
 		container_of(to_delayed_work(work), struct mt6323_charger, maint);
 	unsigned int con0;
+	int uv;
 
-	/* Pet the watchdog every cycle so it can't time out and cut the charge. */
 	mt6323_charger_kick_wdt(chg->regmap);
-
-	/*
-	 * If the charger is present but the charge path fell off, re-assert it -
-	 * but only for a pack that is not essentially full. Near CV the current
-	 * tapers to ~nothing and a latch-off there is legitimate charge-done, which
-	 * must not be fought (that was the every-few-seconds re-enable flapping).
-	 */
-	if (!regmap_read(chg->regmap, MT6323_CHR_CON0, &con0) &&
-	    (con0 & RGS_CHRDET) && !(con0 & RG_CHR_EN) &&
-	    mt6323_vbat_uv(chg) < 4150000) {
+	uv = mt6323_vbat_uv(chg);
+	if (regmap_read(chg->regmap, MT6323_CHR_CON0, &con0)) {
+		chg->healthy_checks = 0;
+		if (recovery_1a)
+			regmap_update_bits(chg->regmap, MT6323_CHR_CON4,
+					   RG_CS_VTH_MASK, RG_CS_VTH_450MA);
+		goto reschedule;
+	}
+	if (recovery_1a) {
+		/* A live cable replug needs the full USB-download-release sequence. */
+		if ((con0 & RGS_CHRDET) && !chg->input_present) {
+			mt6323_charger_hw_init(chg);
+			chg->healthy_checks = 0;
+		}
+		chg->input_present = !!(con0 & RGS_CHRDET);
+		regmap_update_bits(chg->regmap, MT6323_CHR_CON4, RG_CS_VTH_MASK,
+			mt6323_recovery_current_code(&chg->healthy_checks, con0, uv));
+	}
+	/* Never interpret an ADC error as a depleted battery. */
+	if ((con0 & RGS_CHRDET) && !(con0 & RG_CHR_EN) &&
+	    uv >= 0 && uv < 4150000 &&
+	    (!recovery_1a || ((con0 & BIT(6)) && !(con0 & BIT(7))))) {
 		mt6323_charger_enable(chg);
-		dev_info_ratelimited(chg->dev,
-				     "charge path had latched off; re-enabled\n");
+		dev_info_ratelimited(chg->dev, "charge path had latched off; re-enabled\n");
 		power_supply_changed(chg->psy);
 	}
-
+reschedule:
 	schedule_delayed_work(&chg->maint, msecs_to_jiffies(CHG_MAINT_MS));
 }
 
@@ -292,6 +311,18 @@ static int mt6323_charger_get_prop(struct power_supply *psy,
 	int ret;
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
+		ret = regmap_read(chg->regmap, MT6323_CHR_CON4, &con0);
+		if (ret)
+			return ret;
+		/* Report the programmed limit, not a measured charging current. */
+		if ((con0 & RG_CS_VTH_MASK) == 0x6)
+			val->intval = 1000000;
+		else if ((con0 & RG_CS_VTH_MASK) == RG_CS_VTH_450MA)
+			val->intval = 450000;
+		else
+			return -ENODATA;
+		break;
 	case POWER_SUPPLY_PROP_ONLINE:
 		ret = regmap_read(chg->regmap, MT6323_CHR_CON0, &con0);
 		if (ret)
@@ -305,6 +336,7 @@ static int mt6323_charger_get_prop(struct power_supply *psy,
 }
 
 static enum power_supply_property mt6323_charger_props[] = {
+	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
 	POWER_SUPPLY_PROP_ONLINE,
 };
 
