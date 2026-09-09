@@ -1281,6 +1281,20 @@ static bool bringup_trace;
 module_param(bringup_trace, bool, 0644);
 MODULE_PARM_DESC(bringup_trace, "Pace DSI probe diagnostics for USB capture");
 
+/* Recovery diagnostic: initialize and retain the PHY before probe MMIO. */
+static bool bringup_phy;
+module_param(bringup_phy, bool, 0444);
+MODULE_PARM_DESC(bringup_phy, "Initialize DSI PHY before probe register access");
+
+static void mtk_dsi_bringup_power_off(void *data)
+{
+	struct mtk_dsi *dsi = data;
+
+	phy_power_off(dsi->phy);
+	clk_disable_unprepare(dsi->digital_clk);
+	clk_disable_unprepare(dsi->engine_clk);
+}
+
 static int mtk_dsi_probe(struct platform_device *pdev)
 {
 	struct mtk_dsi *dsi;
@@ -1347,13 +1361,30 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 		clk_disable_unprepare(dsi->engine_clk);
 		return dev_err_probe(dev, ret, "Failed to enable DSI digital clock\n");
 	}
+	if (bringup_phy) {
+		dev_info(dev, "powering DSI PHY before register access\n");
+		msleep(100);
+		ret = phy_power_on(dsi->phy);
+		if (ret) {
+			clk_disable_unprepare(dsi->digital_clk);
+			clk_disable_unprepare(dsi->engine_clk);
+			return dev_err_probe(dev, ret, "DSI bring-up PHY failed\n");
+		}
+		ret = devm_add_action_or_reset(dev, mtk_dsi_bringup_power_off, dsi);
+		if (ret)
+			return ret;
+		dev_info(dev, "DSI bring-up PHY powered\n");
+		msleep(100);
+	}
 	dev_info(dev, "clearing DSI interrupt state\n");
 	if (bringup_trace)
 		msleep(100);
 	writel(0, dsi->regs + DSI_INTEN);
 	writel(readl(dsi->regs + DSI_INTSTA), dsi->regs + DSI_INTSTA);
-	clk_disable_unprepare(dsi->digital_clk);
-	clk_disable_unprepare(dsi->engine_clk);
+	if (!bringup_phy) {
+		clk_disable_unprepare(dsi->digital_clk);
+		clk_disable_unprepare(dsi->engine_clk);
+	}
 	dev_info(dev, "DSI interrupt state cleared\n");
 	if (bringup_trace)
 		msleep(100);
