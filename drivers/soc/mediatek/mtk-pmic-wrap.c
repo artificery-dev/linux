@@ -2277,6 +2277,33 @@ static const struct pmic_wrapper_type pwrap_mt2701 = {
 	.init_soc_specific = pwrap_mt2701_init_soc_specific,
 };
 
+/*
+ * MT6582's pwrap is register-identical to mt2701's (same offsets, same
+ * RDDMY/SI_CK_CON init for MT6323). It has no bridge, and there is no mainline
+ * MT6582 reset controller, so drop PWRAP_CAP_RESET - the bootloader already
+ * initialises pwrap and the driver re-runs the (idempotent) init sequence.
+ */
+static const struct pmic_wrapper_type pwrap_mt6582 = {
+	.regs = mt2701_regs,
+	.type = PWRAP_MT2701,
+	.arb_en_all = 0x3f,
+	/*
+	 * Enable NO pwrap interrupt sources. LK inits pwrap and we do not use
+	 * PWRAP_CAP_RESET (no reset controller wired), so the block comes up
+	 * with stale INT flags latched; enabling them (as mt2701 does) makes
+	 * pwrap_interrupt() storm "unexpected interrupt" and wedges the boot.
+	 * We only need pwrap read/write for the charger, which does not use the
+	 * interrupt at all - so keep INT_EN masked off entirely.
+	 */
+	.int_en_all = 0,
+	.int1_en_all = 0,
+	.spi_w = PWRAP_MAN_CMD_SPI_WRITE_NEW,
+	.wdt_src = PWRAP_WDT_SRC_MASK_ALL,
+	.caps = PWRAP_CAP_DCM,
+	.init_reg_clock = pwrap_mt2701_init_reg_clock,
+	.init_soc_specific = pwrap_mt2701_init_soc_specific,
+};
+
 static const struct pmic_wrapper_type pwrap_mt6765 = {
 	.regs = mt6765_regs,
 	.type = PWRAP_MT6765,
@@ -2446,6 +2473,7 @@ static const struct pmic_wrapper_type pwrap_mt8186 = {
 
 static const struct of_device_id of_pwrap_match_tbl[] = {
 	{ .compatible = "mediatek,mt2701-pwrap", .data = &pwrap_mt2701 },
+	{ .compatible = "mediatek,mt6582-pwrap", .data = &pwrap_mt6582 },
 	{ .compatible = "mediatek,mt6765-pwrap", .data = &pwrap_mt6765 },
 	{ .compatible = "mediatek,mt6779-pwrap", .data = &pwrap_mt6779 },
 	{ .compatible = "mediatek,mt6795-pwrap", .data = &pwrap_mt6795 },
@@ -2578,15 +2606,23 @@ static int pwrap_probe(struct platform_device *pdev)
 	if (HAS_CAP(wrp->master->caps, PWRAP_CAP_INT1_EN))
 		pwrap_writel(wrp, wrp->master->int1_en_all, PWRAP_INT1_EN);
 
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0)
-		return irq;
-
-	ret = devm_request_irq(wrp->dev, irq, pwrap_interrupt,
-			       IRQF_TRIGGER_HIGH,
-			       "mt-pmic-pwrap", wrp);
-	if (ret)
-		return ret;
+	/*
+	 * The pwrap interrupt only reports starvation/request exceptions; we do
+	 * not need it for simple read/write (the MT6323 charger path). On the
+	 * MT6582 the line comes up asserted (LK leaves pwrap running and we have
+	 * no reset controller to clear it), so registering pwrap_interrupt()
+	 * makes it storm "unexpected interrupt" and wedge the boot. Make the IRQ
+	 * optional: when the DT omits it (our board), skip request_irq entirely
+	 * so the GIC keeps the line masked. Platforms that provide it still work.
+	 */
+	irq = platform_get_irq_optional(pdev, 0);
+	if (irq > 0) {
+		ret = devm_request_irq(wrp->dev, irq, pwrap_interrupt,
+				       IRQF_TRIGGER_HIGH,
+				       "mt-pmic-pwrap", wrp);
+		if (ret)
+			return ret;
+	}
 
 	wrp->regmap = devm_regmap_init(wrp->dev, NULL, wrp, wrp->slave->regops->regmap);
 	if (IS_ERR(wrp->regmap))
