@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_CONSYS
+	bool "MediaTek MT6582 on-SoC connectivity subsystem (WMT/STP over BTIF)"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	depends on OF
+	help
+	  The MT6572/MT6582 family carries its Bluetooth/WiFi/FM/GPS radios on
+	  the SoC ("CONSYS"), reached through the BTIF link with MediaTek's
+	  WMT (management) and STP (transport) protocol stack, ported here from
+	  the vendor GPL kernel.
+
+config MTK_CONSYS_BT
+	bool "Bluetooth over CONSYS STP (hci driver for BlueZ)"
+	depends on MTK_CONSYS && BT
+	help
+	  A kernel hci device on the STP Bluetooth channel, so BlueZ sees an
+	  ordinary hci0.
+
+config MTK_CONSYS_BT_CHRDEV
+	bool "The vendor /dev/stpbt char device as well"
+	depends on MTK_CONSYS
+	help
+	  The Android-style raw H4 char device (for a userspace HCI attach or
+	  bring-up tests). Exclusive with the hci driver: the STP Bluetooth
+	  channel has one consumer, so bring hci0 down before using it.
