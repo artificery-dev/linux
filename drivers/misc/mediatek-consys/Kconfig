@@ -31,3 +31,11 @@ config MTK_CONSYS_WIFI
 	  Build the MT6582 vendor full-MAC station driver, ported to the
 	  current cfg80211 API. The radio firmware is managed through WMT and
 	  packets use the SoC's dedicated AHB HIF at 0x180f0000.
+
+config MTK_CONSYS_FM
+	tristate "MT6627 FM radio over CONSYS STP"
+	depends on MTK_CONSYS
+	help
+	  Build the FM receiver driver for the MT6627-compatible radio inside
+	  MT6582. Control and RDS data use the FM channel of the MediaTek WMT/STP
+	  transport. The receiver exposes the vendor /dev/fm ioctl interface.

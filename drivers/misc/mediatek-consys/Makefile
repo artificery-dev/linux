@@ -10,3 +10,4 @@ subdir-ccflags-y += -Wno-unused-variable -Wno-unused-function -Wno-format -Wno-u
 obj-$(CONFIG_MTK_CONSYS) += plat/ btif/ common/ detect/
 obj-$(CONFIG_MTK_CONSYS_BT) += bt/
 obj-$(CONFIG_MTK_CONSYS) += wifi/
+obj-$(CONFIG_MTK_CONSYS_FM) += fmradio/
