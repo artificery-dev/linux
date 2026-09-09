@@ -78,4 +78,14 @@ config MTK_SOCINFO
 	  information about the SoC to the userspace including the
 	  manufacturer name, marketing name and soc name.
 
+config MTK_MT6582_MFG_POWER
+	bool "MediaTek MT6582 MFG (Mali-400 GPU) power domain"
+	depends on PM_GENERIC_DOMAINS
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	help
+	  Minimal genpd provider that runs the MT6582 MFG MTCMOS power-up
+	  sequence and ungates the GPU clock gate, so the lima driver can drive
+	  the on-SoC Mali-400 MP2. There is no full MT6582 SCPSYS/clock driver;
+	  the clock source is left as the bootloader configured it.
+
 endmenu
