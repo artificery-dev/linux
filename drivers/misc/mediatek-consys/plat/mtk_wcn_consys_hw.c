@@ -20,6 +20,7 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/mfd/mt6323/registers.h>
 #include <linux/regmap.h>
@@ -69,6 +70,8 @@ static bool ap2conn_osc;	/* set AP2CONN_OSC_EN (0x10001f00 bit 10) at power-on *
 module_param(ap2conn_osc, bool, 0644);
 static bool pmic_hw_mode = true;	/* vendor PMIC init: TOP_CKCON 0x120 SRCLKEN/OSC in HW mode */
 module_param(pmic_hw_mode, bool, 0644);
+static unsigned int pmic_clock_settle_ms = 100;
+module_param(pmic_clock_settle_ms, uint, 0644);
 static bool paldo_sw;		/* keep VCN33_BT/WIFI under software control (no HW request line) */
 module_param(paldo_sw, bool, 0644);
 static bool force_vcn33_wifi;	/* keep the WiFi PA rail on while BT is on */
@@ -76,6 +79,88 @@ module_param(force_vcn33_wifi, bool, 0644);
 #define MT6323_TOP_CKCON_120	0x120
 #define  RG_SRCLKEN_HW_MODE	BIT(4)
 #define  RG_OSC_HW_MODE		BIT(5)
+
+static bool pmic_clock_prepared;
+static unsigned long pmic_clock_ready_jiffies;
+
+static int consys_pmic_clock_field(u16 reg, u16 mask, u16 val)
+{
+	int ret;
+
+	ret = regmap_update_bits(consys_plat.pmic, reg, mask, val);
+	/* Stock's pmic_config_interface() performs each field as an independent
+	 * PWRAP transaction.  Keep that ordering visible to the PMIC instead of
+	 * collapsing adjacent fields into one update. */
+	udelay(5);
+	return ret;
+}
+
+INT32 mtk_wcn_consys_hw_pmic_init(void)
+{
+	struct consys_plat *p = &consys_plat;
+	u32 ckpdn, ckcon, rst, vtcxo;
+	int ret;
+
+	if (!pmic_hw_mode || pmic_clock_prepared)
+		return 0;
+	if (!p->pmic)
+		return -ENODEV;
+
+	/* Exact connectivity-clock subset and field order from MT6323
+	 * PMIC_INIT_SETTING_V1().  Stock runs this from the PMIC fs_initcall,
+	 * seconds before the first CONSYS power-on. */
+	ret = consys_pmic_clock_field(0x102, BIT(6), BIT(6));
+	if (!ret)
+		ret = consys_pmic_clock_field(0x102, BIT(11), 0);
+	if (!ret)
+		ret = consys_pmic_clock_field(0x102, BIT(15), BIT(15));
+	if (!ret)
+		ret = consys_pmic_clock_field(MT6323_TOP_CKCON_120,
+					       RG_SRCLKEN_HW_MODE,
+					       RG_SRCLKEN_HW_MODE);
+	if (!ret)
+		ret = consys_pmic_clock_field(MT6323_TOP_CKCON_120,
+					       RG_OSC_HW_MODE,
+					       RG_OSC_HW_MODE);
+	if (!ret)
+		ret = consys_pmic_clock_field(0x148, BIT(1), BIT(1));
+	if (!ret)
+		ret = consys_pmic_clock_field(0x148, BIT(3), BIT(3));
+	if (!ret)
+		ret = consys_pmic_clock_field(0x402, BIT(0), BIT(0));
+	if (!ret)
+		ret = consys_pmic_clock_field(0x402, BIT(11), 0);
+	if (ret) {
+		WMT_PLAT_ERR_FUNC("early PMIC clock setup failed (%d)\n", ret);
+		return ret;
+	}
+
+	pmic_clock_ready_jiffies = jiffies;
+	pmic_clock_prepared = true;
+	regmap_read(p->pmic, 0x102, &ckpdn);
+	regmap_read(p->pmic, MT6323_TOP_CKCON_120, &ckcon);
+	regmap_read(p->pmic, 0x148, &rst);
+	regmap_read(p->pmic, 0x402, &vtcxo);
+	WMT_PLAT_INFO_FUNC("early PMIC clock setup: 102=%04x 120=%04x 148=%04x 402=%04x, settle %u ms\n",
+			   ckpdn, ckcon, rst, vtcxo, pmic_clock_settle_ms);
+	return 0;
+}
+
+static void consys_pmic_clock_wait(void)
+{
+	unsigned long deadline, remaining;
+
+	if (!pmic_clock_prepared || !pmic_clock_settle_ms)
+		return;
+	deadline = pmic_clock_ready_jiffies +
+		msecs_to_jiffies(pmic_clock_settle_ms);
+	if (!time_before(jiffies, deadline))
+		return;
+	remaining = deadline - jiffies;
+	WMT_PLAT_INFO_FUNC("waiting %u ms for early PMIC clock setup\n",
+			   jiffies_to_msecs(remaining));
+	msleep(jiffies_to_msecs(remaining) + 1);
+}
 
 static int consys_rail(struct regulator *r, bool *state, bool on)
 {
@@ -159,20 +244,14 @@ INT32 mtk_wcn_consys_hw_reg_ctrl(UINT32 on, UINT32 co_clock_en)
 		return -ENODEV;
 	}
 	if (on) {
-		if (pmic_hw_mode) {
-			/* The stock kernel's PMIC_INIT_SETTING: the PMIC follows
-			 * the SoC's SRCLKEN / OSC request lines. A cold boot
-			 * leaves them in software mode. */
-			regmap_update_bits(p->pmic, MT6323_TOP_CKCON_120,
-					   RG_SRCLKEN_HW_MODE | RG_OSC_HW_MODE,
-					   RG_SRCLKEN_HW_MODE | RG_OSC_HW_MODE);
-			/* more of PMIC_INIT_SETTING_V1: the clock outputs
-			 * (0x102: RTC_75K off, DRV_32K on, BUCK32K off) and the
-			 * TCXO LDO in low-power-select, software control (0x402) */
-			regmap_update_bits(p->pmic, 0x102, BIT(6) | BIT(11) | BIT(15), BIT(6) | BIT(15));
-			regmap_update_bits(p->pmic, 0x402, BIT(0) | BIT(11), BIT(0));
-			regmap_update_bits(p->pmic, 0x148, BIT(1) | BIT(3), BIT(1) | BIT(3));
+		/* Probe normally performed this well before WMT can request power.
+		 * Retain a fallback for unusual built-as-module/deferred-probe order. */
+		if (pmic_hw_mode && !pmic_clock_prepared) {
+			iRet = mtk_wcn_consys_hw_pmic_init();
+			if (iRet)
+				return iRet;
 		}
+		consys_pmic_clock_wait();
 		/* 1. VCN_1V8 LDO on, out of low-power mode (0x512[1] = 0) */
 		regmap_update_bits(p->pmic, MT6323_DIGLDO_CON11, VCN_1V8_LP_MODE_SET, 0);
 		iRet = consys_rail(p->vcn18, &vcn18_on, true);

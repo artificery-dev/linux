@@ -219,6 +219,7 @@ typedef enum _ENUM_EMI_CTRL_STATE_OFFSET_{
 ********************************************************************************
 */
 extern INT32 mtk_wcn_consys_hw_init(void);
+extern INT32 mtk_wcn_consys_hw_pmic_init(void);
 extern INT32 mtk_wcn_consys_hw_deinit(void);
 extern INT32 mtk_wcn_consys_hw_pwr_off (VOID);
 extern INT32 mtk_wcn_consys_hw_pwr_on (UINT32 co_clock_en);

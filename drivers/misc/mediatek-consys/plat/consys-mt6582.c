@@ -38,6 +38,7 @@
 #include <linux/regulator/consumer.h>
 #include "consys_res.h"
 #include "consys_plat.h"
+#include "mtk_wcn_consys_hw.h"
 
 struct consys_plat consys_plat;
 
@@ -135,10 +136,20 @@ static int consys_probe(struct platform_device *pdev)
 
 	p->co_clock = of_property_read_bool(dev->of_node, "mediatek,co-clock");
 
+	/* Stock applies the MT6323 oscillator/SRCLKEN/VTCXO fields from the PMIC
+	 * fs_initcall, long before the first CONSYS power request.  Establish that
+	 * clock history as soon as pwrap is available instead of doing it inside
+	 * mtk_wcn_consys_hw_reg_ctrl(). */
+	p->ready = true;
+	ret = mtk_wcn_consys_hw_pmic_init();
+	if (ret) {
+		p->ready = false;
+		return dev_err_probe(dev, ret, "early PMIC clock setup\n");
+	}
+
 	dev_info(dev, "MT6582 CONSYS: EMI window %pa (%pa), bgf irq %d, %s\n",
 		 &p->emi_phys, &p->emi_size, consys_irq_bgf,
 		 p->co_clock ? "co-clock" : "own crystal");
-	p->ready = true;
 	return 0;
 }
 
