@@ -1276,6 +1276,11 @@ static const struct mipi_dsi_host_ops mtk_dsi_ops = {
 	.transfer = mtk_dsi_host_transfer,
 };
 
+/* Optional pacing lets the USB diagnostic reader drain before a bus stall. */
+static bool bringup_trace;
+module_param(bringup_trace, bool, 0644);
+MODULE_PARM_DESC(bringup_trace, "Pace DSI probe diagnostics for USB capture");
+
 static int mtk_dsi_probe(struct platform_device *pdev)
 {
 	struct mtk_dsi *dsi;
@@ -1332,6 +1337,8 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 	 * accesses with either gate closed can stall the interconnect.
 	 */
 	dev_info(dev, "enabling DSI probe clocks\n");
+	if (bringup_trace)
+		msleep(100);
 	ret = clk_prepare_enable(dsi->engine_clk);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to enable DSI engine\n");
@@ -1341,11 +1348,15 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "Failed to enable DSI digital clock\n");
 	}
 	dev_info(dev, "clearing DSI interrupt state\n");
+	if (bringup_trace)
+		msleep(100);
 	writel(0, dsi->regs + DSI_INTEN);
 	writel(readl(dsi->regs + DSI_INTSTA), dsi->regs + DSI_INTSTA);
 	clk_disable_unprepare(dsi->digital_clk);
 	clk_disable_unprepare(dsi->engine_clk);
 	dev_info(dev, "DSI interrupt state cleared\n");
+	if (bringup_trace)
+		msleep(100);
 
 	init_waitqueue_head(&dsi->irq_wait_queue);
 
