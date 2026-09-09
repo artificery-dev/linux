@@ -490,6 +490,16 @@ config BACKLIGHT_LED
 	  If you have a LCD backlight adjustable by LED class driver, say Y
 	  to enable this driver.
 
+config BACKLIGHT_MT6323
+	tristate "MediaTek MT6323 PMIC backlight driver"
+	depends on MTK_PMIC_WRAP || COMPILE_TEST
+	help
+	  Say Y to enable the LCD backlight for the MediaTek MT6323 PMIC (e.g.
+	  the Innioasis Y2). The panel backlight is the MT6323's four ISINK
+	  constant-current channels ganged together; this driver drives all
+	  four as a single backlight-class device (unlike leds-mt6323, which
+	  exposes them as independent LEDs).
+
 endif # BACKLIGHT_CLASS_DEVICE
 
 endmenu
