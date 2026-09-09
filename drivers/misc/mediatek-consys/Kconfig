@@ -23,3 +23,11 @@ config MTK_CONSYS_BT_CHRDEV
 	  The Android-style raw H4 char device (for a userspace HCI attach or
 	  bring-up tests). Exclusive with the hci driver: the STP Bluetooth
 	  channel has one consumer, so bring hci0 down before using it.
+
+config MTK_CONSYS_WIFI
+	bool "MT6582 full-MAC WiFi over the CONSYS AHB HIF"
+	depends on MTK_CONSYS && CFG80211
+	help
+	  Build the MT6582 vendor full-MAC station driver, ported to the
+	  current cfg80211 API. The radio firmware is managed through WMT and
+	  packets use the SoC's dedicated AHB HIF at 0x180f0000.

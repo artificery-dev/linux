@@ -31,6 +31,10 @@
 #include <net/net_namespace.h>
 #include <linux/string.h>
 
+/* dev_change_name() is internal in current kernels; this built-in legacy
+ * control device still uses it for its optional AP interface rename. */
+extern int dev_change_name(struct net_device *dev, const char *newname);
+
 #include "wmt_exp.h"
 #include "stp_exp.h"
 
@@ -595,7 +599,7 @@ static int WIFI_init(void)
     sema_init(&wr_mtx, 1);
 	
 #if WMT_CREATE_NODE_DYNAMIC  //mknod replace
-    wmtwifi_class = class_create(THIS_MODULE,"wmtWifi");
+    wmtwifi_class = class_create("wmtWifi");
     if(IS_ERR(wmtwifi_class))
         goto error;
     wmtwifi_dev = device_create(wmtwifi_class,NULL,dev,NULL,"wmtWifi");
