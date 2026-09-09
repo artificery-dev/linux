@@ -1018,4 +1018,14 @@ config FUEL_GAUGE_MM8013
 	  the state of charge, temperature, cycle count, actual and design
 	  capacity, etc.
 
+config CHARGER_MT6323
+	tristate "MediaTek MT6323 PMIC charger"
+	depends on MTK_PMIC_WRAP || COMPILE_TEST
+	depends on OF
+	select REGMAP
+	help
+	  Say Y to enable the battery charger for the MediaTek MT6323 PMIC
+	  (as paired with the MT6582). Enables the hardware CC/CV charge loop
+	  via the pwrap PMIC bus.
+
 endif # POWER_SUPPLY
