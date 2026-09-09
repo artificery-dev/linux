@@ -49,6 +49,12 @@ static const struct of_device_id mtk_tz_smp_boot_infos[] __initconst = {
 };
 
 static const struct of_device_id mtk_smp_boot_infos[] __initconst = {
+	/*
+	 * MT6582's SRAMROM sits at 0x10202000, the MT7623 layout: the jump
+	 * address goes into +0x34 and each core spins in the boot ROM until
+	 * its own magic key lands in +0x38/+0x3c/+0x40.
+	 */
+	{ .compatible   = "mediatek,mt6582", .data = &mtk_mt7623_boot },
 	{ .compatible   = "mediatek,mt6589", .data = &mtk_mt6589_boot },
 	{ .compatible   = "mediatek,mt7623", .data = &mtk_mt7623_boot },
 	{ .compatible   = "mediatek,mt7629", .data = &mtk_mt7623_boot },
