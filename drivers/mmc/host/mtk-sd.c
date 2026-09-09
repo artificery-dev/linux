@@ -1157,8 +1157,9 @@ static void msdc_track_cmd_data(struct msdc_host *host, struct mmc_command *cmd)
 	if (host->error &&
 	    ((!mmc_op_tuning(cmd->opcode) && !host->hs400_tuning) ||
 	     cmd->error == -ETIMEDOUT))
-		dev_warn(host->dev, "%s: cmd=%d arg=%08X; host->error=0x%08X\n",
-			 __func__, cmd->opcode, cmd->arg, host->error);
+		dev_dbg(host->dev,
+			"%s: cmd=%d arg=%08X; host->error=0x%08X\n",
+			__func__, cmd->opcode, cmd->arg, host->error);
 }
 
 static void msdc_request_done(struct msdc_host *host, struct mmc_request *mrq)
@@ -1501,10 +1502,12 @@ static int msdc_ops_switch_volt(struct mmc_host *mmc, struct mmc_ios *ios)
 		}
 
 		/* Apply different pinctrl settings for different signal voltage */
-		if (ios->signal_voltage == MMC_SIGNAL_VOLTAGE_180)
-			pinctrl_select_state(host->pinctrl, host->pins_uhs);
-		else
-			pinctrl_select_state(host->pinctrl, host->pins_default);
+		if (host->pinctrl) {
+			if (ios->signal_voltage == MMC_SIGNAL_VOLTAGE_180)
+				pinctrl_select_state(host->pinctrl, host->pins_uhs);
+			else
+				pinctrl_select_state(host->pinctrl, host->pins_default);
+		}
 	}
 	return 0;
 }
@@ -2788,25 +2791,32 @@ static int msdc_drv_probe(struct platform_device *pdev)
 		goto host_free;
 	}
 
+	/*
+	 * Y2: pinctrl is optional. The MT6582 has no mainline pinctrl driver,
+	 * but LK already muxes the eMMC (boot device) pins, so we can run with
+	 * the pins as-left. Treat a pinctrl-get error as "no pinctrl" and skip
+	 * the state lookups / select calls.
+	 */
 	host->pinctrl = devm_pinctrl_get(&pdev->dev);
 	if (IS_ERR(host->pinctrl)) {
-		ret = PTR_ERR(host->pinctrl);
-		dev_err(&pdev->dev, "Cannot find pinctrl!\n");
-		goto host_free;
+		dev_info(&pdev->dev, "no pinctrl; using bootloader pin config\n");
+		host->pinctrl = NULL;
 	}
 
-	host->pins_default = pinctrl_lookup_state(host->pinctrl, "default");
-	if (IS_ERR(host->pins_default)) {
-		ret = PTR_ERR(host->pins_default);
-		dev_err(&pdev->dev, "Cannot find pinctrl default!\n");
-		goto host_free;
-	}
+	if (host->pinctrl) {
+		host->pins_default = pinctrl_lookup_state(host->pinctrl, "default");
+		if (IS_ERR(host->pins_default)) {
+			ret = PTR_ERR(host->pins_default);
+			dev_err(&pdev->dev, "Cannot find pinctrl default!\n");
+			goto host_free;
+		}
 
-	host->pins_uhs = pinctrl_lookup_state(host->pinctrl, "state_uhs");
-	if (IS_ERR(host->pins_uhs)) {
-		ret = PTR_ERR(host->pins_uhs);
-		dev_err(&pdev->dev, "Cannot find pinctrl uhs!\n");
-		goto host_free;
+		host->pins_uhs = pinctrl_lookup_state(host->pinctrl, "state_uhs");
+		if (IS_ERR(host->pins_uhs)) {
+			ret = PTR_ERR(host->pins_uhs);
+			dev_err(&pdev->dev, "Cannot find pinctrl uhs!\n");
+			goto host_free;
+		}
 	}
 
 	/* Support for SDIO eint irq ? */
