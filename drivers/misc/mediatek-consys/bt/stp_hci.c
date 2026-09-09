@@ -172,10 +172,35 @@ static int stp_hci_close(struct hci_dev *hdev)
  * scanning reports nothing and LE connections never complete. Correct the
  * bitmap and re-send the mask once the core has finished its init.
  */
+static void stp_hci_radio_cal(struct hci_dev *hdev)
+{
+	static const struct { u16 opcode; u8 len; u8 param[7]; } cmds[] = {
+		{ 0xfc79, 6, { 0x05, 0x07, 0x03, 0x40, 0x1f, 0x40 } }, /* Set_Radio */
+		{ 0xfc7a, 7, { 0x1f, 0x00, 0x04, 0x80, 0x00, 0xff, 0xff } },
+		{ 0xfc93, 3, { 0x00, 0x00, 0x00 } },
+	};
+	struct sk_buff *skb;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cmds); i++) {
+		skb = __hci_cmd_sync(hdev, cmds[i].opcode, cmds[i].len,
+				     cmds[i].param, HCI_CMD_TIMEOUT);
+		if (IS_ERR(skb)) {
+			bt_dev_warn(hdev, "radio cal %04x: %ld",
+				    cmds[i].opcode, PTR_ERR(skb));
+			continue;
+		}
+		kfree_skb(skb);
+	}
+	bt_dev_info(hdev, "NVRAM radio calibration applied");
+}
+
 static int stp_hci_post_init(struct hci_dev *hdev)
 {
 	u8 events[8] = { 0 };
 	struct sk_buff *skb;
+
+	stp_hci_radio_cal(hdev);
 
 	if (hdev->commands[26] & 0x18)
 		return 0;		/* a controller that tells the truth */

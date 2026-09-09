@@ -70,7 +70,7 @@ static bool ap2conn_osc;	/* set AP2CONN_OSC_EN (0x10001f00 bit 10) at power-on *
 module_param(ap2conn_osc, bool, 0644);
 static bool pmic_hw_mode = true;	/* vendor PMIC init: TOP_CKCON 0x120 SRCLKEN/OSC in HW mode */
 module_param(pmic_hw_mode, bool, 0644);
-static unsigned int pmic_clock_settle_ms = 100;
+static unsigned int pmic_clock_settle_ms = 5000;
 module_param(pmic_clock_settle_ms, uint, 0644);
 static bool paldo_sw;		/* keep VCN33_BT/WIFI under software control (no HW request line) */
 module_param(paldo_sw, bool, 0644);
