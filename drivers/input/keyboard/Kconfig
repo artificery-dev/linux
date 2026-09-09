@@ -778,6 +778,17 @@ config KEYBOARD_MT6779
 	  To compile this driver as a module, choose M here: the
 	  module will be called mt6779-keypad.
 
+config KEYBOARD_MT6582
+	tristate "MediaTek MT6582 keypad support"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	help
+	  Say Y here to use the keypad matrix on the MediaTek MT6582 (e.g. the
+	  Innioasis Y2 volume keys). The controller auto-scans and reports the
+	  debounced key state in KP_MEM1; this small driver maps its bits to
+	  keycodes and is interrupt-driven (no polling).
+
+	  To compile as a module choose M; it is called mt6582-keypad.
+
 config KEYBOARD_MTK_PMIC
 	tristate "MediaTek PMIC keys support"
 	depends on MFD_MT6397 || COMPILE_TEST
