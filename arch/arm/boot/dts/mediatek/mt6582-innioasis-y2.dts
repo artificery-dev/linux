@@ -1,0 +1,851 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Innioasis Y2 (MT6582) - mainline kernel board device tree.
+ *
+ * Uses the mainline mt6582.dtsi (CPU/GIC/sysirq/timer/uart with fixed clocks -
+ * no clock or pinctrl driver needed for a basic boot). Display is the real
+ * mtk-drm KMS pipeline (OVL->RDMA->COLOR->DSI -> gc9503v panel); the LK
+ * bootloader's live scanout keeps showing the boot logo until mtk-drm's first
+ * modeset takes the hardware over at a frame boundary.
+ */
+
+/dts-v1/;
+#include "mt6582.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/clock/mt6582-clk.h>
+
+/ {
+	model = "Innioasis Y2";
+	compatible = "innioasis,y2", "mediatek,mt6582";
+
+	/*
+	 * All four Cortex-A7s. LK boots CPU0 and leaves the others spinning
+	 * in the boot ROM waiting for their magic key in SRAMROM; the mt6589
+	 * SMP method (mach-mediatek/platsmp.c, taught the mt6582 SRAMROM in
+	 * patch 0018) releases them. The vendor 3.4 kernel used the same
+	 * registers and keys on this SoC.
+	 */
+	cpus {
+		enable-method = "mediatek,mt6589-smp";
+	};
+
+	chosen {
+		/* ttyS0 is the UART (silent unless pads are wired). The kernel
+		 * cmdline is forced (CONFIG_CMDLINE_FORCE), so this is only the
+		 * early stdout hint. fbcon rides the mtk-drm fbdev once the
+		 * first modeset runs. */
+		stdout-path = "serial0:921600n8";
+	};
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	/*
+	 * Main DRAM only. The device's top ~32 MB (0xbe000000..0xc0000000)
+	 * holds the LK framebuffer and other vendor carveouts (per the device's
+	 * /proc/iomem: System RAM ends at 0xbdffffff). Keeping memory below that
+	 * leaves the framebuffer at 0xbfb00000 untouched - no reserved-memory
+	 * node needed since it is outside the kernel's RAM.
+	 */
+	memory@80000000 {
+		device_type = "memory";
+		/* Full DRAM: 0x80000000..0xbdffffff = 992 MB, exactly the vendor's
+		 * "System RAM" per /proc/iomem (one contiguous block, no mid-range
+		 * carveouts). The framebuffer/mtkfb carveout (0xbfb00000+) sits
+		 * above this, so it is never treated as RAM. 992 MB exceeds the
+		 * ~760 MB ARM lowmem window, so CONFIG_HIGHMEM=y is required (set
+		 * in y2.config). */
+		reg = <0x80000000 0x3e000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * The connectivity subsystem's EMI window: the CONSYS MCU sees
+		 * it at 0xf0000000 through the infracfg remap register
+		 * (0x10002310, MiB index + enable), and the AP-side control
+		 * block, firmware print buffer and core dumps live at +0x80000.
+		 * The vendor kernel stole 1 MiB, 1 MiB aligned, from memblock;
+		 * the remap granularity is what forces the alignment. Top of
+		 * DRAM, out of the kernel's way.
+		 */
+		consys_emi: consys@bdf00000 {
+			reg = <0xbdf00000 0x100000>;
+			no-map;
+		};
+	};
+
+	/*
+	 * simple-framebuffer over the live LK framebuffer.
+	 * 480x360, 16bpp RGB565 - confirmed by the decompressor colour-box test
+	 * (a 32bpp pattern rendered garbled/doubled; the panel is 16bpp).
+	 *
+	 * The mtkfb region is 0xbfb00000..0xbfffffff, triple-buffered
+	 * (virtual_size 480x1080). LK pans to the middle buffer (yoffset=360)
+	 * before handing off, so the panel actually scans out buffer 1 at
+	 * 0xbfb00000 + 360*480*2 = 0xbfb54600 - confirmed by a per-buffer colour
+	 * test (buf0 red invisible, buf1 green fills the screen). Point simplefb
+	 * there or fbcon draws into an off-screen buffer.
+	 */
+	/*
+	 * MSDC source/host clock. The real source is MSDCPLL (see clkmgr dump);
+	 * we present a fixed 200 MHz here - the mtk-sd driver divides it down to
+	 * the card clock (init ~200 kHz up to 50 MHz HS), so this only needs to
+	 * be in the right ballpark for the divider maths. Refine if data CRCs.
+	 */
+	msdc_clk: msdc-clk {
+		compatible = "fixed-clock";
+		clock-frequency = <200000000>;
+		#clock-cells = <0>;
+	};
+
+	/*
+	 * Fixed 3.3V rail for the eMMC vmmc-supply. Gives the mmc host a valid
+	 * ocr_avail (3.3V window) so card init can match the eMMC's voltage.
+	 * The real rail is a PMIC output already enabled by LK; model it as a
+	 * simple always-on fixed regulator until the PMIC is brought up.
+	 */
+	reg_vmmc: regulator-vmmc {
+		compatible = "regulator-fixed";
+		regulator-name = "vmmc_3v3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	/*
+	 * Internal eMMC (msdc0). MT6582's msdc IP matches the MT8135 generation,
+	 * so we bind the mainline mtk-sd driver via "mediatek,mt8135-mmc". LK
+	 * already muxes these pins (it is the boot device) and pinctrl is patched
+	 * optional, so no pinctrl node is needed. This is mmcblk0 (rootfs on p8).
+	 */
+	mmc0: mmc@11230000 {
+		compatible = "mediatek,mt8135-mmc";
+		reg = <0x11230000 0x1000>;
+		interrupts = <GIC_SPI 39 IRQ_TYPE_LEVEL_LOW>;
+		/* Real clocks: source = MSDC30_0 top mux (~200 MHz, = the old fake),
+		 * hclk = the pericfg MSDC30_0 gate. mtk-sd divides source internally
+		 * (no clk_set_rate), so behaviour is identical to the fixed-clock. */
+		clocks = <&topckgen CLK_TOP_MSDC30_0_SEL>, <&pericfg CLK_PERI_MSDC30_0>;
+		clock-names = "source", "hclk";
+		bus-width = <8>;
+		max-frequency = <50000000>;
+		cap-mmc-highspeed;
+		non-removable;
+		no-sd;
+		no-sdio;
+		vmmc-supply = <&reg_vmmc>;
+		status = "okay";
+	};
+
+	/*
+	 * External microSD (msdc1) = mmcblk1. Removable, so poll for the card
+	 * (broken-cd - no card-detect GPIO wired without pinctrl/gpio). May not
+	 * work if LK does not mux the msdc1 pins; eMMC is the priority.
+	 */
+	mmc1: mmc@11240000 {
+		compatible = "mediatek,mt8135-mmc";
+		reg = <0x11240000 0x1000>;
+		interrupts = <GIC_SPI 40 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&topckgen CLK_TOP_MSDC30_1_SEL>, <&pericfg CLK_PERI_MSDC30_1>;
+		clock-names = "source", "hclk";
+		bus-width = <4>;
+		max-frequency = <50000000>;
+		cap-sd-highspeed;
+		broken-cd;
+		vmmc-supply = <&reg_vmmc>;
+		status = "okay";
+	};
+
+	/*
+	 * USB. MT6582 has a MUSB controller (mac @0x11200000) + a USB2 PHY in the
+	 * USB SIF block (@0x11210000). The bootloader leaves the USB clocks on
+	 * (clkmgr: PERI_USB, MUX_USB20 enabled), so the 3 clocks the mainline
+	 * musb glue wants are modelled as one always-on fixed 48MHz clock. Brought
+	 * up peripheral-only for a USB serial gadget console. IRQ = GIC_SPI 32
+	 * (vendor Linux IRQ 64 - 32).
+	 */
+	usb_ck: usb-clk {
+		compatible = "fixed-clock";
+		clock-frequency = <48000000>;
+		#clock-cells = <0>;
+	};
+
+	clk26m: clk26m {
+		compatible = "fixed-clock";
+		clock-frequency = <26000000>;
+		#clock-cells = <0>;
+	};
+
+	/*
+	 * PMIC wrapper (pwrap) - the SPI-ish bus to the MT6323 PMIC. MT6582's
+	 * pwrap is register-identical to mt2701 (see the mt6582-pwrap variant we
+	 * added). LK already initialises it. The first child names the slave PMIC
+	 * (mt6323) so pwrap picks the right regmap; the charger is a second child
+	 * that grabs that regmap directly (no mt6397 MFD / EINT needed).
+	 * IRQ = GIC_SPI 115 (vendor Linux IRQ 147 - 32).
+	 */
+	pwrap: pwrap@1000d000 {
+		compatible = "mediatek,mt6582-pwrap";
+		reg = <0x1000d000 0x1000>;
+		reg-names = "pwrap";
+		/*
+		 * No "interrupts" on purpose. The pwrap INT line comes up
+		 * asserted on the MT6582 (LK leaves pwrap running, no reset
+		 * controller to clear it) and only reports starvation/exception
+		 * conditions we do not need for the charger. The driver treats
+		 * the IRQ as optional; omitting it here keeps the GIC line
+		 * masked instead of storming "unexpected interrupt".
+		 */
+		clocks = <&clk26m>, <&clk26m>;
+		clock-names = "spi", "wrap";
+
+		/*
+		 * MT6323 PMIC as an mt6397-family MFD. Regmap comes from pwrap
+		 * (the parent); the PMIC's interrupt line to the SoC is a
+		 * dedicated EINT (EINT 25, level-high) - NOT the pwrap wrapper
+		 * IRQ - so it hangs off our gpio/eint controller. The MFD spawns
+		 * the mt6323 sub-devices (keys/rtc/regulator/led/codec); only the
+		 * ones whose driver is enabled bind. Power key = KEY_POWER,
+		 * wakeup-capable, via mtk-pmic-keys on INT_STATUS0 bit0.
+		 */
+		pmic: mt6323 {
+			compatible = "mediatek,mt6323";
+			interrupt-parent = <&pio>;
+			interrupts = <25 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+
+			mt6323keys: mt6323keys {
+				compatible = "mediatek,mt6323-keys";
+				mediatek,long-press-mode = <1>;
+				power-off-time-sec = <0>;
+
+				power {
+					linux,keycodes = <KEY_POWER>;
+					wakeup-source;
+				};
+			};
+
+			rtc {
+				compatible = "mediatek,mt6323-rtc";
+			};
+
+			/* PMIC power-off controller: gives the kernel a working
+			 * pm_power_off (writes RTC_BBPU) so shutdown actually cuts
+			 * power instead of hanging. The RTC-block base comes from the
+			 * mt6397 MFD cell, so no reg here. */
+			power-controller {
+				compatible = "mediatek,mt6323-pwrc";
+			};
+
+			/*
+			 * PMIC rails. Only the ones a consumer needs are described;
+			 * the regulator core leaves undescribed rails exactly as LK
+			 * set them (no constraints, so no "disable unused" pass).
+			 * VGP2 is the CS43131's 1.8 V rail ("CS_DAC" in the stock
+			 * kernel, hwPowerOn(6, 1800)); LK leaves it off, and the DAC
+			 * browns out and resets as soon as its serial port runs.
+			 */
+			regulators {
+				compatible = "mediatek,mt6323-regulator";
+
+				mt6323_vgp2_reg: ldo_vgp2 {
+					regulator-name = "vgp2";
+					regulator-min-microvolt = <1800000>;
+					regulator-max-microvolt = <1800000>;
+					regulator-enable-ramp-delay = <216>;
+				};
+
+				/*
+				 * The connectivity subsystem's rails, switched by the
+				 * CONSYS driver in the vendor order: VCN18 (digital
+				 * core) first, VCN28 (RF/crystal, only when not in
+				 * co-clock mode or for FM/GPS), VCN33_BT / VCN33_WIFI
+				 * (the PAs) per function. The regulator driver models
+				 * the enables; the "HW control" bits (0x416[5],
+				 * 0x418[14], 0x41c[14]) are written through pwrap.
+				 */
+				mt6323_vcn18_reg: ldo_vcn18 {
+					regulator-name = "vcn18";
+					regulator-min-microvolt = <1800000>;
+					regulator-max-microvolt = <1800000>;
+					regulator-enable-ramp-delay = <44>;
+				};
+
+				mt6323_vcn28_reg: ldo_vcn28 {
+					regulator-name = "vcn28";
+					regulator-min-microvolt = <2800000>;
+					regulator-max-microvolt = <2800000>;
+					regulator-enable-ramp-delay = <264>;
+				};
+
+				mt6323_vcn33_bt_reg: ldo_vcn33_bt {
+					regulator-name = "vcn33_bt";
+					/* the vendor's VOL_3300 (the LDO defaults to 3.6 V) */
+					regulator-min-microvolt = <3300000>;
+					regulator-max-microvolt = <3300000>;
+					regulator-enable-ramp-delay = <264>;
+				};
+
+				mt6323_vcn33_wifi_reg: ldo_vcn33_wifi {
+					regulator-name = "vcn33_wifi";
+					/* the vendor's VOL_3300 (the LDO defaults to 3.6 V) */
+					regulator-min-microvolt = <3300000>;
+					regulator-max-microvolt = <3300000>;
+					regulator-enable-ramp-delay = <264>;
+				};
+
+				/* The vibration motor's rail: the stock vibrator driver
+				 * is nothing but this LDO switched on and off. */
+				mt6323_vibr_reg: ldo_vibr {
+					regulator-name = "vibr";
+					/* The motor's range: 3.3 V is the rail's top and
+					 * a firm click; the low end is a soft one. */
+					regulator-min-microvolt = <1800000>;
+					regulator-max-microvolt = <3300000>;
+					regulator-enable-ramp-delay = <36>;
+				};
+			};
+		};
+
+		/*
+		 * LCD backlight = the MT6323's four ISINK channels ganged in
+		 * parallel (vendor "lcd-backlight" = PMIC LCD_ISINK). Driven as a
+		 * single backlight-class device by mt6323-backlight (a pwrap
+		 * regmap child, like the charger) - leds-mt6323 would expose the
+		 * four channels independently, which can't turn the panel off.
+		 */
+		backlight: mt6323-backlight {
+			compatible = "mediatek,mt6323-backlight";
+		};
+
+		charger: mt6323-charger {
+			compatible = "mediatek,mt6323-charger";
+		};
+	};
+
+	/*
+	 * I2C0 - the bus with the click-wheel controller (APT32F @ 0x51). Same IP
+	 * as mt2701 (mt6577-i2c): reg = i2c regs + its AP-DMA channel (0x11000200,
+	 * AP_DMA_BASE 0x11000000 + 0x200). Fixed clock models main+dma (LK leaves
+	 * peri clocks on); clock-div=16 like mt2701. IRQ GIC_SPI 44.
+	 */
+	i2c_ck: i2c-clk {
+		compatible = "fixed-clock";
+		clock-frequency = <66000000>;
+		#clock-cells = <0>;
+	};
+
+	i2c0: i2c@11007000 {
+		compatible = "mediatek,mt6577-i2c";
+		reg = <0x11007000 0x70>, <0x11000200 0x80>;
+		interrupts = <GIC_SPI 44 IRQ_TYPE_LEVEL_LOW>;
+		clock-div = <16>;
+		clocks = <&i2c_ck>, <&i2c_ck>;
+		clock-names = "main", "dma";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/*
+		 * APT32F click-wheel controller. Nav zones come out as GPIO/EINT
+		 * lines (see gpio-keys); wheel rotation is read here over i2c on
+		 * the controller's data-ready EINT (GPIO 55).
+		 */
+		wheel@51 {
+			compatible = "innioasis,apt32f-wheel";
+			reg = <0x51>;
+			interrupts-extended = <&pio 55 IRQ_TYPE_EDGE_FALLING>;
+		};
+	};
+
+	/*
+	 * I2C1 - the audio bus: the CS43131 DAC (0x30) and the AW87559 speaker
+	 * amplifier (0x58), as on the stock system (i2c_devices.txt: 1-0030
+	 * cs43131_dac, 1-0058 aw87559_pa). AP-DMA channel 1 at 0x11000280,
+	 * IRQ = vendor 77 - 32 = GIC_SPI 45.
+	 */
+	i2c1: i2c@11008000 {
+		compatible = "mediatek,mt6577-i2c";
+		reg = <0x11008000 0x70>, <0x11000280 0x80>;
+		interrupts = <GIC_SPI 45 IRQ_TYPE_LEVEL_LOW>;
+		clock-div = <16>;
+		clocks = <&i2c_ck>, <&i2c_ck>;
+		clock-names = "main", "dma";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/*
+		 * Cirrus CS43131 headphone DAC, I2S clock consumer with its
+		 * own 22.5792 MHz crystal (the stock driver logs "Slave Mode,
+		 * 22.5792M XTAL input"). The mainline cs43130 driver covers the
+		 * CS43131. Its five rails are PMIC outputs LK leaves on; they
+		 * are modelled by the always-on stub below until the MT6323
+		 * regulator driver is in. Jack detection is the DAC's own.
+		 */
+		cs43131: audio-codec@30 {
+			compatible = "cirrus,cs43131";
+			reg = <0x30>;
+			/*
+			 * The stock driver raises GPIO 20, 18 and 15 (in that
+			 * order), waits 50 ms and then talks to the chip; the
+			 * three GPIO-backed "regulators" below reproduce that;
+			 * the analog rails come from VGP2, the PMIC LDO the stock
+			 * kernel turns on for it ("CS_DAC", 1.8 V).
+			 */
+			VA-supply = <&mt6323_vgp2_reg>;
+			VP-supply = <&mt6323_vgp2_reg>;
+			VCP-supply = <&mt6323_vgp2_reg>;
+			VL-supply = <&reg_dac_15>;
+			VD-supply = <&reg_dac_18>;
+			/* the DAC's INT pin: GPIO 16, level-low (EINT16 on stock) */
+			interrupts-extended = <&pio 16 IRQ_TYPE_LEVEL_LOW>;
+			cirrus,xtal-ibias = <2>;
+		};
+
+		/*
+		 * Awinic AW87559 class-D speaker amplifier, behind the DAC. The
+		 * enable line is GPIO 8 (stock: mode 0, out; low 10 ms, high,
+		 * 100 ms before the chip answers).
+		 */
+		aw87559: amplifier@58 {
+			compatible = "awinic,aw87559";
+			reg = <0x58>;
+			enable-gpios = <&pio 8 GPIO_ACTIVE_HIGH>;
+			sound-name-prefix = "PA";
+		};
+	};
+
+	/*
+	 * The CS43131's three power-control lines, as fixed regulators so the
+	 * codec driver's supply handling raises them and waits the 50 ms the
+	 * stock driver waits after the last one. Voltages are nominal.
+	 */
+	reg_dac_20: regulator-dac-20 {
+		compatible = "regulator-fixed";
+		regulator-name = "cs43131_en20";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		gpio = <&pio 20 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <50000>;
+	};
+
+	reg_dac_18: regulator-dac-18 {
+		compatible = "regulator-fixed";
+		regulator-name = "cs43131_en18";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		gpio = <&pio 18 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <50000>;
+		/* GPIO 20 is raised first: chain it as this line's input */
+		vin-supply = <&reg_dac_20>;
+	};
+
+	reg_dac_15: regulator-dac-15 {
+		compatible = "regulator-fixed";
+		regulator-name = "cs43131_en15";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		gpio = <&pio 15 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <50000>;
+	};
+
+	/*
+	 * Audio front end (AFE): the MT8135-generation block at 0x11220000
+	 * (vendor AudDrv_Afe.h AUDIO_HW_PHYSICAL_BASE), IRQ = vendor 136 - 32
+	 * = GIC_SPI 104, level-low like the vendor's IRQF_TRIGGER_LOW. Clocks
+	 * are the infracfg audio gate and the two top muxes it hangs off.
+	 */
+	afe: audio-controller@11220000 {
+		compatible = "mediatek,mt6582-afe-pcm";
+		reg = <0x11220000 0x1000>;
+		interrupts = <GIC_SPI 104 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&infracfg CLK_INFRA_AUDIO>,
+			 <&topckgen CLK_TOP_AUDINTBUS_SEL>,
+			 <&topckgen CLK_TOP_AUDIO_SEL>;
+		clock-names = "infra_audio", "audintbus", "audio";
+	};
+
+	/*
+	 * The vibration motor, as a force-feedback device: regulator-haptic
+	 * drives the VIBR rail between the two voltages by rumble strength,
+	 * for the input's clicks and ticks (tempod's haptic op plays them).
+	 */
+	haptics {
+		compatible = "regulator-haptic";
+		haptic-supply = <&mt6323_vibr_reg>;
+		min-microvolt = <1800000>;
+		max-microvolt = <3300000>;
+	};
+
+	sound {
+		compatible = "mediatek,mt6582-cs43131";
+		mediatek,platform = <&afe>;
+		mediatek,audio-codec = <&cs43131>;
+		mediatek,audio-amp = <&aw87559>;
+	};
+
+	/*
+	 * Always-on system power manager.  The first driver slice installs the
+	 * stock normal-mode PCM program, which services source-clock and thermal
+	 * handshakes; suspend/deep-idle are deliberately left disabled.  The SPM
+	 * register bank is also used by the CONSYS and MFG power-domain drivers,
+	 * whose mappings are intentionally shared.
+	 */
+	spm: system-power-manager@10006000 {
+		compatible = "mediatek,mt6582-spm", "syscon";
+		reg = <0x10006000 0x1000>;
+		interrupts = <GIC_SPI 117 IRQ_TYPE_LEVEL_LOW>;
+	};
+
+	/*
+	 * The connectivity subsystem (CONSYS): the MT6582's on-SoC BT/WiFi/FM/
+	 * GPS block with its own MCU, like the MT6572's. Bluetooth, FM and GPS
+	 * ride the BTIF link below with MediaTek's WMT/STP stack (patch 0020,
+	 * drivers/misc/mediatek-consys, the vendor conn_soc driver ported);
+	 * WiFi has its own HIF. This node is the platform glue: the SPM CONN
+	 * MTCMOS (SPM_CONN_PWR_CON 0x280, status bit 1), the AXI protection
+	 * and EMI remap in infracfg, the CONN MCU config block (chip id at
+	 * +0x8 reads 0x6582 once powered), the CONNMCU infra clock gate, the
+	 * four MT6323 rails, and the CONN2AP wakeup line (vendor IRQ 217).
+	 */
+	consys: connectivity@18070000 {
+		compatible = "mediatek,mt6582-consys";
+		reg = <0x10006000 0x1000>,	/* SPM */
+		      <0x10001000 0x2000>,	/* INFRACFG_AO (+0x1310 EMI remap, +0x1f00 AP2CONN OSC) */
+		      <0x10007000 0x100>,	/* AP_RGU */
+		      <0x18070000 0x1000>,	/* CONN_MCU_CONFIG */
+		      <0x180b0000 0x10000>;	/* CONN_TOP_CR */
+		reg-names = "spm", "infracfg", "rgu", "conn-mcu", "conn-top";
+		interrupts = <GIC_SPI 185 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "bgf";
+		clocks = <&infracfg CLK_INFRA_CONNMCU>;
+		clock-names = "connmcu";
+		vcn18-supply = <&mt6323_vcn18_reg>;
+		vcn28-supply = <&mt6323_vcn28_reg>;
+		vcn33-bt-supply = <&mt6323_vcn33_bt_reg>;
+		vcn33-wifi-supply = <&mt6323_vcn33_wifi_reg>;
+		mediatek,pwrap = <&pwrap>;
+		memory-region = <&consys_emi>;
+		/* WMT_SOC.cfg: co_clock_flag=1 - the 26 MHz comes from the AP. */
+		mediatek,co-clock;
+	};
+
+	/*
+	 * Dedicated AP-to-CONNSYS WiFi host interface. Vendor IRQ 216 is GIC
+	 * SPI 184; the full-MAC firmware and power sequence are owned by WMT.
+	 */
+	wifi@180f0000 {
+		compatible = "mediatek,mt6582-wifi";
+		reg = <0x180f0000 0x1000>;
+		interrupts = <GIC_SPI 184 IRQ_TYPE_LEVEL_LOW>;
+	};
+
+	/*
+	 * BTIF: the UART-like link between the AP and the CONSYS MCU (vendor
+	 * IRQ 82 = GIC SPI 50), with its two AP_DMA virtual-FIFO channels at
+	 * AP_DMA + 0x780 (TX, vendor IRQ 103) and + 0x800 (RX, IRQ 104).
+	 */
+	btif: btif@1100c000 {
+		compatible = "mediatek,mt6582-btif";
+		reg = <0x1100c000 0x100>, <0x11000000 0x1000>;
+		reg-names = "btif", "apdma";
+		interrupts = <GIC_SPI 50 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 71 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 72 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "btif", "tx-dma", "rx-dma";
+		clocks = <&pericfg CLK_PERI_BTIF>, <&pericfg CLK_PERI_AP_DMA>;
+		clock-names = "btif", "apdma";
+	};
+
+	u2phy: phy@11210000 {
+		compatible = "mediatek,mt6582-u2phy";
+		reg = <0x11210000 0x1000>;
+		#phy-cells = <0>;
+	};
+
+	usb0: usb@11200000 {
+		compatible = "mediatek,mtk-musb";
+		reg = <0x11200000 0x1000>;
+		interrupts = <GIC_SPI 32 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "mc";	/* musb_probe() does platform_get_irq_byname("mc") */
+		phys = <&u2phy>;
+		clocks = <&usb_ck>, <&usb_ck>, <&usb_ck>;
+		clock-names = "main", "mcu", "univpll";
+		dr_mode = "peripheral";
+	};
+
+	/*
+	 * GPIO + EINT controller. reg[0] = GPIO block (0x10005000), reg[1] =
+	 * EINT block (0x1000b000, register-identical to mtk_generic_eint_regs).
+	 * EINT number == GPIO number on the MT6582. The single GIC line feeding
+	 * the EINT block is vendor Linux IRQ 145 = GIC_SPI 113. LK muxes the
+	 * pins; this node provides GPIO in/out + wakeup-capable interrupts.
+	 */
+	pio: gpio@10005000 {
+		compatible = "mediatek,mt6582-gpio";
+		reg = <0x10005000 0x1000>, <0x1000b000 0x1000>;
+		reg-names = "gpio", "eint";
+		interrupts = <GIC_SPI 113 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		ngpios = <169>;
+	};
+
+	/*
+	 * Click-wheel nav buttons. The APT32F wheel controller drives these as
+	 * dedicated active-low GPIO/EINT lines (verified: rest=1, press=0).
+	 * Wheel rotation/scroll comes over i2c instead (separate driver).
+	 * Keycodes match the vendor mapping. All are wakeup sources.
+	 */
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		key-prev {
+			label = "Prev";
+			gpios = <&pio 6 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_LEFT>;
+			wakeup-source;
+		};
+		key-menu {
+			label = "Menu";
+			gpios = <&pio 7 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_BACK>;
+			wakeup-source;
+		};
+		key-next {
+			label = "Next";
+			gpios = <&pio 9 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_RIGHT>;
+			wakeup-source;
+		};
+		key-play {
+			label = "Play";
+			gpios = <&pio 10 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_PLAYPAUSE>;
+			wakeup-source;
+		};
+		key-select {
+			label = "Select";
+			gpios = <&pio 54 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_ENTER>;
+			wakeup-source;
+		};
+	};
+
+	/*
+	 * Side volume keys - on the MT6582 keypad matrix (not GPIO). The
+	 * controller auto-scans and reports the debounced state in KP_MEM1:
+	 * bit0 = Vol-Down, bit1 = Vol-Up (confirmed on device). Edge IRQ =
+	 * vendor Linux IRQ 148 = GIC_SPI 116.
+	 */
+	keypad: keypad@10011000 {
+		compatible = "mediatek,mt6582-keypad";
+		reg = <0x10011000 0x1000>;
+		interrupts = <GIC_SPI 116 IRQ_TYPE_EDGE_FALLING>;
+		linux,keycodes = <KEY_VOLUMEDOWN KEY_VOLUMEUP>;
+	};
+
+	/*
+	 * No simple-framebuffer node: LK's scanout (boot logo at 0xbfb54600,
+	 * inside the 0xbfb00000+ carveout above RAM) is deliberately left
+	 * running, untouched, until mtk-drm's first modeset parks it at a
+	 * frame boundary and takes over the pipeline. See
+	 * mtk_dsi_ddp_quiesce() in the mediatek DRM driver.
+	 */
+
+	/*
+	 * ARM Mali-400 MP2 (Utgard), driven by the mainline lima driver. The IP
+	 * register block is at 0x13010000 (GP +0, L2 +0x1000, GP_MMU +0x3000,
+	 * PP0/PP1_MMU +0x4000/+0x5000, PP0/PP1 +0x8000/+0xa000 - the standard
+	 * Mali-400 layout, matching the vendor iomem). Six interrupts = vendor
+	 * Linux IRQ 202-207 = GIC_SPI 170-175.
+	 *
+	 * There is no mainline MT6582 clock/SCPSYS driver, so the MFG MTCMOS power
+	 * domain + clock gate are brought up by mt6582-mfg-power (a small genpd
+	 * provider); the clock SOURCE is left as LK configured it (~286 MHz),
+	 * modelled here as a fixed clock for lima's bus/core handles.
+	 */
+	mfg_clk: mfg-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <286000000>;
+	};
+
+	mfg_pd: power-controller@10006000 {
+		compatible = "mediatek,mt6582-mfg-power";
+		reg = <0x10006000 0x1000>,	/* SPM (MTCMOS) */
+		      <0x13000000 0x10>,	/* MFG clock gate */
+		      <0x14000100 0x10>;	/* DISP clock gate (SMI_COMMON) */
+		#power-domain-cells = <0>;
+	};
+
+	gpu: gpu@13010000 {
+		compatible = "arm,mali-400", "arm,mali-utgard";
+		reg = <0x13010000 0x10000>;
+		/* LEVEL_LOW like every other MT6582 sysirq block (the DISP
+		 * engines above): declared HIGH, these lines read permanently
+		 * asserted, storm at probe, get disabled by the spurious-IRQ
+		 * guard, and lima silently falls back to a ~200ms poll per job
+		 * - which caps the whole GPU at ~5fps. */
+		interrupts = <GIC_SPI 170 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 171 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 172 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 173 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 174 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 175 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "gp", "gpmmu", "pp0", "ppmmu0", "pp1", "ppmmu1";
+		clocks = <&mfg_clk>, <&mfg_clk>;
+		clock-names = "bus", "core";
+		power-domains = <&mfg_pd>;
+	};
+
+	/*
+	 * Real MT6582 clock tree (CCF), register bases from the vendor mt_clkmgr
+	 * (see drivers/clk/mediatek/clk-mt6582*.c). apmixedsys holds the main PLLs;
+	 * topckgen the top muxes/dividers; infracfg/pericfg the peripheral gates.
+	 * Additive for now: existing devices keep their fixed-clock placeholders
+	 * until migrated one at a time, and the kernel boots with clk_ignore_unused
+	 * (see CONFIG_CMDLINE) so unclaimed gates that LK left on are not disabled.
+	 */
+	apmixedsys: clock-controller@10209000 {
+		compatible = "mediatek,mt6582-apmixedsys";
+		reg = <0x10209000 0x1000>;
+		#clock-cells = <1>;
+	};
+
+	topckgen: clock-controller@10000000 {
+		compatible = "mediatek,mt6582-topckgen";
+		reg = <0x10000000 0x1000>;
+		#clock-cells = <1>;
+	};
+
+	infracfg: clock-controller@10001000 {
+		compatible = "mediatek,mt6582-infracfg";
+		reg = <0x10001000 0x1000>;
+		#clock-cells = <1>;
+	};
+
+	pericfg: clock-controller@10003000 {
+		compatible = "mediatek,mt6582-pericfg";
+		reg = <0x10003000 0x1000>;
+		#clock-cells = <1>;
+	};
+
+	/*
+	 * DISP/KMS pipeline (mtk-drm), WIP. Reuses the register-compatible mt2701
+	 * DDP components + mt8173 mipi-tx (see patch 0017). mmsys spawns the
+	 * clk-mt6582-mm (mm clock gates) and the mediatek-drm master, which builds
+	 * the OVL0->RDMA0->COLOR0->BLS->DSI0 path from its driver data. No M4U/SMI/
+	 * larb needed: mtk-drm falls back to CMA and the SMI path stays powered by
+	 * the force-on SMI clock gates. IRQs are GIC SPI (vendor IRQ - 32).
+	 */
+	mmsys: syscon@14000000 {
+		compatible = "mediatek,mt6582-mmsys", "syscon";
+		reg = <0x14000000 0x1000>;
+		#clock-cells = <1>;
+	};
+
+	ovl0: ovl@14007000 {
+		compatible = "mediatek,mt6582-disp-ovl";
+		reg = <0x14007000 0x1000>;
+		interrupts = <GIC_SPI 153 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&mmsys CLK_MM_DISP_OVL>;
+	};
+
+	rdma0: rdma@14008000 {
+		compatible = "mediatek,mt6582-disp-rdma";
+		reg = <0x14008000 0x1000>;
+		interrupts = <GIC_SPI 152 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&mmsys CLK_MM_DISP_RDMA>;
+	};
+
+	color0: color@1400b000 {
+		compatible = "mediatek,mt6582-disp-color";
+		reg = <0x1400b000 0x1000>;
+		interrupts = <GIC_SPI 156 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&mmsys CLK_MM_DISP_COLOR>;
+	};
+
+	bls: pwm@1400a000 {
+		compatible = "mediatek,mt2701-disp-pwm";
+		reg = <0x1400a000 0x1000>;
+		#pwm-cells = <2>;
+		clocks = <&mmsys CLK_MM_MDP_BLS_26M>, <&mmsys CLK_MM_DISP_BLS>;
+		clock-names = "main", "mm";
+	};
+
+	mutex: mutex@1400e000 {
+		compatible = "mediatek,mt6582-disp-mutex";
+		reg = <0x1400e000 0x1000>;
+		interrupts = <GIC_SPI 161 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&mmsys CLK_MM_MUTEX_32K>;
+	};
+
+	mipitx: mipi-tx@10010000 {
+		compatible = "mediatek,mt6582-mipi-tx";
+		reg = <0x10010000 0x1000>;
+		clocks = <&clk26m>;
+		clock-output-names = "mipi_tx0_pll";
+		#clock-cells = <0>;
+		#phy-cells = <0>;
+	};
+
+	dsi0: dsi@1400c000 {
+		compatible = "mediatek,mt6582-dsi";
+		reg = <0x1400c000 0x1000>;
+		interrupts = <GIC_SPI 157 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&mmsys CLK_MM_DSI_ENGINE>,
+			 <&mmsys CLK_MM_DSI_DIGITAL>,
+			 <&mipitx>;
+		clock-names = "engine", "digital", "hs";
+		phys = <&mipitx>;
+		phy-names = "dphy";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		panel@0 {
+			compatible = "innioasis,y2-gc9503v";
+			reg = <0>;
+
+			port {
+				panel_in: endpoint {
+					remote-endpoint = <&dsi_out>;
+				};
+			};
+		};
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dsi_out: endpoint {
+					remote-endpoint = <&panel_in>;
+				};
+			};
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+	/* Real clocks: baud = pericfg UART0 gate (uart_sel = 26 MHz, matches the
+	 * dtsi dummy26m), bus = same gate. The UART pads are not wired on the Y2
+	 * so this is silent either way; migrating it off the dtsi fixed clock
+	 * keeps the tree honest. */
+	clocks = <&pericfg CLK_PERI_UART0>, <&pericfg CLK_PERI_UART0>;
+	clock-names = "baud", "bus";
+};
