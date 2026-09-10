@@ -10,10 +10,10 @@
 #include <linux/delay.h>
 static inline void y2_fbmark(u16 color)
 {
-	void __iomem *fb = ioremap(0xbfb54600, 480 * 368 * 2);
+	void __iomem *fb = ioremap(0xbfb54600, 480 * 360 * 2);
 	int i;
 	if (fb) {
-		for (i = 0; i < 480 * 368; i++)
+		for (i = 0; i < 480 * 360; i++)
 			writew(color, fb + i * 2);
 		iounmap(fb);
 	}

@@ -123,7 +123,8 @@
 	 * Internal eMMC (msdc0). MT6582's msdc IP matches the MT8135 generation,
 	 * so we bind the mainline mtk-sd driver via "mediatek,mt8135-mmc". LK
 	 * already muxes these pins (it is the boot device) and pinctrl is patched
-	 * optional, so no pinctrl node is needed. This is mmcblk0 (rootfs on p8).
+	 * optional, so no pinctrl node is needed. This is mmcblk0; the rootfs is
+	 * mmcblk0p1, the one partition in Tempo's own MBR at sector zero.
 	 */
 	mmc0: mmc@11230000 {
 		compatible = "mediatek,mt8135-mmc";

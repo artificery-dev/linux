@@ -5,13 +5,14 @@
  * Panel module id "gc9503v_hvga_dsi_vdo_hsd": GC9503V controller, MIPI-DSI
  * video mode (sync-event), 2 data lanes, RGB888 on the DSI link. The init
  * sequence and video timing were reverse-engineered from the Y2's vendor LK
- * bootloader (references/roms/stock-3.1.7/lk.bin, get_params @0x1EDE4, init
- * @0x1EF04, cmd table @file 0x378DC); see src/y2/docs/disp-kms-notes.md.
+ * bootloader (get_params @0x1EDE4, init @0x1EF04, cmd table @file 0x378DC in
+ * the stock lk.bin); see docs/porting/display.md in the Tempo repository.
  *
- * Active area is 480x368 (RGB565 framebuffer). Note the vendor LK LCM_PARAMS
- * programs only 360 active lines, but on-device testing showed that leaves an
- * unpainted 8-line sliver at the bottom - the panel is physically 368 tall, so
- * we drive the full height here.
+ * The mode is 480x360, the geometry LK programs, so the bootloader logo,
+ * plymouth and the player all share one framebuffer size and the hand-offs
+ * between them never involve a mode change. Earlier on-device testing
+ * suggested the glass is 368 lines tall and LK under-scans the last 8; Tempo
+ * keeps LK's 360. The framebuffer is RGB565.
  */
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
@@ -161,14 +162,11 @@ static int gc9503v_unprepare(struct drm_panel *panel)
 }
 
 /*
- * Video-mode timing. Horizontal + porches are the vendor LK LCM_PARAMS values;
- * the active HEIGHT is 368, not the 360 LK programs. On-device framebuffer
- * testing showed 360 leaves an unpainted ~8-line sliver at the bottom, i.e. the
- * panel is physically 480x368 and the vendor LCM under-scans by 8 lines. We
- * drive the full 368 so the whole panel is painted.
+ * Video-mode timing: the vendor LK LCM_PARAMS values, including the 360
+ * active lines (see the note at the top of this file).
  *   h: active 480, fp 200, sync 10, bp 200  -> htotal 890
- *   v: active 368, fp 60,  sync 8,  bp 60   -> vtotal 496
- *   pixel clock 27.36 MHz (from LK's timing) -> ~62 Hz at vtotal 496
+ *   v: active 360, fp 60,  sync 8,  bp 60   -> vtotal 488
+ *   pixel clock 27.36 MHz (from LK's timing) -> ~63 Hz at vtotal 488
  * The framebuffer is 16bpp RGB565 (verified with an RGBW/MYCB test pattern);
  * that's the DRM plane format and is independent of the 24-bit DSI link.
  */
