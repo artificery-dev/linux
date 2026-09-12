@@ -329,6 +329,9 @@
 
 		charger: mt6323-charger {
 			compatible = "mediatek,mt6323-charger";
+			/* BC1.1 charger-port detection borrows D+/D- through the PHY. */
+			phys = <&u2phy>;
+			phy-names = "usb";
 		};
 	};
 

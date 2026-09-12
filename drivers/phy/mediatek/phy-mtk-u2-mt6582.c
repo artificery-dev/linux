@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/phy/phy.h>
+#include <linux/phy/phy-mt6582-u2.h>
 #include <linux/platform_device.h>
 
 #define U2PHY_OFF	0x800		/* PHY regs start 0x800 into USB_SIF */
@@ -75,9 +76,34 @@ static int mt6582_u2phy_power_off(struct phy *phy)
 	return 0;
 }
 
+/*
+ * The stock kernel sets RG_USB20_BC11_SW_EN right before its charger-port
+ * detection and clears it right after, before usb_phy_recover(): the switch
+ * hands D+/D- to the MT6323's BC1.1 comparator. The charger driver drives it
+ * through these submodes; there is no other mode to select on this PHY.
+ */
+static int mt6582_u2phy_set_mode(struct phy *phy, enum phy_mode mode, int submode)
+{
+	struct mt6582_u2phy *p = phy_get_drvdata(phy);
+
+	if (mode != PHY_MODE_USB_DEVICE)
+		return -EINVAL;
+	switch (submode) {
+	case MT6582_U2PHY_BC11_SET:
+		u2_set8(p, 0x1a, 0x80);	/* RG_USB20_BC11_SW_EN = 1 */
+		return 0;
+	case MT6582_U2PHY_BC11_CLR:
+		u2_clr8(p, 0x1a, 0x80);	/* RG_USB20_BC11_SW_EN = 0 */
+		return 0;
+	default:
+		return 0;
+	}
+}
+
 static const struct phy_ops mt6582_u2phy_ops = {
 	.power_on = mt6582_u2phy_power_on,
 	.power_off = mt6582_u2phy_power_off,
+	.set_mode = mt6582_u2phy_set_mode,
 	.owner = THIS_MODULE,
 };
 

@@ -19,13 +19,17 @@
  * the vendor sources in references/vendor-pmic/ (charging_hw_pmic.c,
  * pmic_mt6323.c, upmu_hw.h).
  */
+#include <linux/bitfield.h>
 #include <linux/bits.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/devm-helpers.h>
 #include <linux/module.h>
 #include <linux/mfd/mt6323/registers.h>
 #include <linux/mod_devicetable.h>
 #include <linux/of.h>
+#include <linux/phy/phy.h>
+#include <linux/phy/phy-mt6582-u2.h>
 #include <linux/platform_device.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
@@ -72,9 +76,27 @@
 /* CHR_CON16: USB download mode */
 #define RG_USBDL_RST		BIT(2)
 #define RG_USBDL_SET		BIT(3)
-/* CHR_CON18: BC1.1 charger-port detection */
+/*
+ * CHR_CON18/19: BC1.1 charger-port detection. The field layout was read off
+ * the stock kernel's PMIC-wrapper traffic (tempo.old/build/hyptrace, the
+ * DCD step sets CON19 0x180, 0x190, 0x191, 0x199 in the vendor's ipu, ipd,
+ * vref, cmp order) and matches the vendor's upmu_hw.h for the MT6582+MT6323
+ * (sprout), which also places VSRC_EN at CON18 [3:2] and the comparator's
+ * output at CON18 bit 7.
+ */
 #define RG_BC11_BB_CTRL		BIT(0)
 #define RG_BC11_RST		BIT(1)
+#define RG_BC11_VSRC_EN_MASK	GENMASK(3, 2)	/* the 0.6 V source on D+ */
+#define RGS_BC11_CMP_OUT	BIT(7)
+#define RG_BC11_VREF_VTH_MASK	GENMASK(1, 0)
+#define RG_BC11_CMP_EN_MASK	GENMASK(3, 2)
+#define RG_BC11_IPD_EN_MASK	GENMASK(5, 4)
+#define RG_BC11_IPU_EN_MASK	GENMASK(7, 6)
+#define RG_BC11_FIELDS_MASK	GENMASK(7, 0)
+#define RG_BC11_BIAS_EN		BIT(8)
+/* The stock kernel's settle after arming the detector and after each step. */
+#define BC11_ARM_MS		50
+#define BC11_STEP_MS		80
 /* CHR_CON20: current-source DAC soft-start step inc/dec */
 #define RG_CSDAC_STP_INC_MASK	GENMASK(2, 0)
 #define RG_CSDAC_STP_DEC_MASK	GENMASK(6, 4)
@@ -127,6 +149,10 @@ struct mt6323_charger {
 	unsigned int healthy_checks;
 	unsigned int current_code;	/* RG_CS_VTH code the driver wants programmed */
 	bool input_present;
+	struct phy *phy;		/* the USB2 PHY whose D+/D- the detector borrows */
+	enum power_supply_usb_type usb_type;
+	bool detect_again;		/* debugfs asked for one more detection */
+	struct dentry *debug;
 };
 
 /*
@@ -304,6 +330,82 @@ static int mt6323_charger_hw_init(struct mt6323_charger *chg)
 	return 0;
 }
 
+/*
+ * One BC1.1 comparison: drive the lines as the step says, wait, read the
+ * comparator, let go. The vendor's step bodies, in its own order of fields.
+ */
+static bool mt6323_bc11_step(struct mt6323_charger *chg, const char *name,
+			     unsigned int vsrc, unsigned int ipu, unsigned int ipd,
+			     unsigned int vref, unsigned int cmp)
+{
+	struct regmap *r = chg->regmap;
+	unsigned int con18 = 0;
+
+	regmap_update_bits(r, MT6323_CHR_CON18, RG_BC11_VSRC_EN_MASK,
+			   FIELD_PREP(RG_BC11_VSRC_EN_MASK, vsrc));
+	regmap_update_bits(r, MT6323_CHR_CON19, RG_BC11_FIELDS_MASK,
+			   FIELD_PREP(RG_BC11_IPU_EN_MASK, ipu) |
+			   FIELD_PREP(RG_BC11_IPD_EN_MASK, ipd) |
+			   FIELD_PREP(RG_BC11_VREF_VTH_MASK, vref) |
+			   FIELD_PREP(RG_BC11_CMP_EN_MASK, cmp));
+	msleep(BC11_STEP_MS);
+	regmap_read(r, MT6323_CHR_CON18, &con18);
+	regmap_update_bits(r, MT6323_CHR_CON19, RG_BC11_FIELDS_MASK, 0);
+	regmap_update_bits(r, MT6323_CHR_CON18, RG_BC11_VSRC_EN_MASK, 0);
+	dev_dbg(chg->dev, "bc11 %s: CON18=0x%04x\n", name, con18);
+	return con18 & RGS_BC11_CMP_OUT;
+}
+
+/*
+ * Classify the port the way the stock kernel did on every plug: data-contact
+ * detect first, then the primary comparison; a charging port gets the
+ * secondary one to tell a dedicated charger from a charging host. Runs in the
+ * maintenance worker, with the PHY's BC11 switch closed for the duration, so
+ * it belongs before the gadget claims the lines - at boot and on a live plug.
+ */
+static enum power_supply_usb_type mt6323_bc11_detect(struct mt6323_charger *chg)
+{
+	struct regmap *r = chg->regmap;
+	enum power_supply_usb_type type;
+
+	if (!chg->phy)
+		return POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	phy_set_mode_ext(chg->phy, PHY_MODE_USB_DEVICE, MT6582_U2PHY_BC11_SET);
+	regmap_update_bits(r, MT6323_CHR_CON19, RG_BC11_BIAS_EN | RG_BC11_FIELDS_MASK,
+			   RG_BC11_BIAS_EN);
+	regmap_update_bits(r, MT6323_CHR_CON18, RG_BC11_BB_CTRL | RG_BC11_RST,
+			   RG_BC11_BB_CTRL | RG_BC11_RST);
+	msleep(BC11_ARM_MS);
+
+	if (mt6323_bc11_step(chg, "dcd", 0, 2, 1, 1, 2)) {
+		/* Contact never settled: a non-standard supply, or an Apple one. */
+		type = mt6323_bc11_step(chg, "a1", 0, 0, 1, 0, 1)
+			? POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID
+			: POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	} else if (!mt6323_bc11_step(chg, "a2", 2, 0, 1, 0, 1)) {
+		/* Primary detection: 0.6 V on D+, sink on D-; a charger lifts D-. */
+		type = POWER_SUPPLY_USB_TYPE_SDP;
+	} else {
+		type = mt6323_bc11_step(chg, "b2", 0, 2, 0, 1, 1)
+			? POWER_SUPPLY_USB_TYPE_DCP
+			: POWER_SUPPLY_USB_TYPE_CDP;
+	}
+
+	regmap_update_bits(r, MT6323_CHR_CON18, RG_BC11_BB_CTRL | RG_BC11_RST,
+			   RG_BC11_BB_CTRL | RG_BC11_RST);
+	regmap_update_bits(r, MT6323_CHR_CON19, RG_BC11_BIAS_EN | RG_BC11_FIELDS_MASK, 0);
+	phy_set_mode_ext(chg->phy, PHY_MODE_USB_DEVICE, MT6582_U2PHY_BC11_CLR);
+	return type;
+}
+
+static const char *const mt6323_usb_type_names[] = {
+	[POWER_SUPPLY_USB_TYPE_UNKNOWN] = "non-standard",
+	[POWER_SUPPLY_USB_TYPE_SDP] = "standard host (SDP)",
+	[POWER_SUPPLY_USB_TYPE_DCP] = "dedicated charger (DCP)",
+	[POWER_SUPPLY_USB_TYPE_CDP] = "charging host (CDP)",
+	[POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID] = "Apple supply",
+};
+
 static void mt6323_charger_maint_work(struct work_struct *work)
 {
 	struct mt6323_charger *chg =
@@ -321,16 +423,25 @@ static void mt6323_charger_maint_work(struct work_struct *work)
 		}
 		goto reschedule;
 	}
-	if (recovery_1a) {
+	if ((con0 & RGS_CHRDET) && (!chg->input_present || chg->detect_again)) {
 		/* A live cable replug needs the full USB-download-release sequence. */
-		if ((con0 & RGS_CHRDET) && !chg->input_present) {
+		if (recovery_1a && !chg->input_present) {
 			mt6323_charger_hw_init(chg);
 			chg->healthy_checks = 0;
 		}
-		chg->input_present = !!(con0 & RGS_CHRDET);
+		chg->detect_again = false;
+		chg->usb_type = mt6323_bc11_detect(chg);
+		dev_info(chg->dev, "input is a %s\n",
+			 mt6323_usb_type_names[chg->usb_type]);
+		power_supply_changed(chg->psy);
+	} else if (!(con0 & RGS_CHRDET) && chg->input_present) {
+		chg->usb_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+		power_supply_changed(chg->psy);
+	}
+	chg->input_present = !!(con0 & RGS_CHRDET);
+	if (recovery_1a)
 		chg->current_code =
 			mt6323_recovery_current_code(&chg->healthy_checks, con0, uv);
-	}
 	mt6323_charger_assert_current(chg, true);
 	/* Never interpret an ADC error as a depleted battery. */
 	if ((con0 & RGS_CHRDET) && !(con0 & RG_CHR_EN) &&
@@ -365,6 +476,9 @@ static int mt6323_charger_get_prop(struct power_supply *psy,
 		if (ret)
 			return ret;
 		val->intval = !!(con0 & RGS_CHRDET);
+		break;
+	case POWER_SUPPLY_PROP_USB_TYPE:
+		val->intval = chg->usb_type;
 		break;
 	default:
 		return -EINVAL;
@@ -413,11 +527,17 @@ static int mt6323_charger_prop_is_writeable(struct power_supply *psy,
 static enum power_supply_property mt6323_charger_props[] = {
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
 	POWER_SUPPLY_PROP_ONLINE,
+	POWER_SUPPLY_PROP_USB_TYPE,
 };
 
 static const struct power_supply_desc mt6323_charger_desc = {
 	.name		= "mt6323-charger",
-	.type		= POWER_SUPPLY_TYPE_MAINS,
+	.type		= POWER_SUPPLY_TYPE_USB,
+	.usb_types	= BIT(POWER_SUPPLY_USB_TYPE_SDP) |
+			  BIT(POWER_SUPPLY_USB_TYPE_CDP) |
+			  BIT(POWER_SUPPLY_USB_TYPE_DCP) |
+			  BIT(POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID) |
+			  BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN),
 	.properties	= mt6323_charger_props,
 	.num_properties	= ARRAY_SIZE(mt6323_charger_props),
 	.get_property	= mt6323_charger_get_prop,
@@ -484,6 +604,33 @@ static const struct power_supply_desc mt6323_battery_desc = {
 	.get_property	= mt6323_battery_get_prop,
 };
 
+/*
+ * debugfs mt6323-charger/detect: write anything to run the port detection
+ * again without a replug. Bring-up only: it borrows D+/D- for ~300 ms, so a
+ * host that has us enumerated may see a glitch.
+ */
+static ssize_t mt6323_detect_write(struct file *file, const char __user *buf,
+				   size_t len, loff_t *ppos)
+{
+	struct mt6323_charger *chg = file->private_data;
+
+	chg->detect_again = true;
+	mod_delayed_work(system_wq, &chg->maint, 0);
+	return len;
+}
+
+static const struct file_operations mt6323_detect_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = mt6323_detect_write,
+	.llseek = noop_llseek,
+};
+
+static void mt6323_charger_remove_debugfs(void *data)
+{
+	debugfs_remove_recursive(data);
+}
+
 static int mt6323_charger_probe(struct platform_device *pdev)
 {
 	struct mt6323_charger *chg;
@@ -496,9 +643,15 @@ static int mt6323_charger_probe(struct platform_device *pdev)
 
 	chg->dev = &pdev->dev;
 	chg->current_code = RG_CS_VTH_450MA;
+	chg->usb_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 	chg->regmap = dev_get_regmap(pdev->dev.parent, NULL);
 	if (!chg->regmap)
 		return dev_err_probe(&pdev->dev, -ENODEV, "no PMIC regmap\n");
+	chg->phy = devm_phy_optional_get(&pdev->dev, "usb");
+	if (IS_ERR(chg->phy))
+		return dev_err_probe(&pdev->dev, PTR_ERR(chg->phy), "no USB PHY\n");
+	if (!chg->phy)
+		dev_info(&pdev->dev, "no USB PHY: charger ports go undetected\n");
 
 	cfg.drv_data = chg;
 	cfg.of_node = pdev->dev.of_node;
@@ -519,7 +672,16 @@ static int mt6323_charger_probe(struct platform_device *pdev)
 					   mt6323_charger_maint_work);
 	if (ret)
 		return ret;
-	schedule_delayed_work(&chg->maint, msecs_to_jiffies(CHG_MAINT_MS));
+	/* The first pass runs the port detection before the gadget comes up. */
+	schedule_delayed_work(&chg->maint, 0);
+
+	chg->debug = debugfs_create_dir("mt6323-charger", NULL);
+	if (!IS_ERR_OR_NULL(chg->debug)) {
+		debugfs_create_file("detect", 0200, chg->debug, chg,
+				    &mt6323_detect_fops);
+		devm_add_action_or_reset(&pdev->dev,
+					 mt6323_charger_remove_debugfs, chg->debug);
+	}
 
 	return 0;
 }
