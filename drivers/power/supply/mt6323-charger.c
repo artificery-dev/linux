@@ -48,6 +48,7 @@
 /* CHR_CON4 */
 #define RG_CS_VTH_MASK		GENMASK(3, 0)
 #define RG_CS_VTH_450MA		0xc		/* charge current ~450mA */
+#define RG_CS_VTH_1A		0x6		/* charge current ~1A */
 /* CHR_CON6 */
 #define RG_VBAT_OV_EN		BIT(0)
 #define RG_VBAT_OV_VTH_MASK	GENMASK(3, 1)
@@ -104,6 +105,19 @@ static bool recovery_1a;
 module_param(recovery_1a, bool, 0444);
 MODULE_PARM_DESC(recovery_1a, "Recovery: promote 450mA to 1A after healthy checks");
 
+/*
+ * RG_CS_VTH code -> charge current limit in microamps (vendor CS_VTH[] table).
+ * The register's reset value is 0xf, a 70mA trickle: less than the system
+ * draws with the display on, so a pack "charging" at that code still drains.
+ */
+static const int mt6323_cs_vth_ua[16] = {
+	1600000, 1500000, 1400000, 1300000, 1200000, 1100000, 1000000, 900000,
+	800000, 700000, 650000, 550000, 450000, 300000, 200000, 70000,
+};
+
+/* The most this single-cell pack is ever asked to take, whatever userspace asks. */
+#define CS_VTH_CODE_MAX_CURRENT	RG_CS_VTH_1A
+
 struct mt6323_charger {
 	struct device *dev;
 	struct regmap *regmap;
@@ -111,8 +125,32 @@ struct mt6323_charger {
 	struct power_supply *batt;
 	struct delayed_work maint;
 	unsigned int healthy_checks;
+	unsigned int current_code;	/* RG_CS_VTH code the driver wants programmed */
 	bool input_present;
 };
+
+/*
+ * (Re)program the charge current limit. The PMIC does not keep CHR_CON4
+ * across its own charge-path resets: after a latch-off the register was found
+ * back at its 0xf reset value with CHR_EN happily set again, so the limit is
+ * asserted on every enable and on every maintenance pass rather than once.
+ */
+static void mt6323_charger_assert_current(struct mt6323_charger *chg, bool report)
+{
+	unsigned int con4;
+
+	if (regmap_read(chg->regmap, MT6323_CHR_CON4, &con4))
+		return;
+	if ((con4 & RG_CS_VTH_MASK) == chg->current_code)
+		return;
+	regmap_update_bits(chg->regmap, MT6323_CHR_CON4, RG_CS_VTH_MASK,
+			   chg->current_code);
+	if (report && !recovery_1a)
+		dev_info_ratelimited(chg->dev,
+			"charge current code was 0x%x, restored to 0x%x (%d mA)\n",
+			con4 & RG_CS_VTH_MASK, chg->current_code,
+			mt6323_cs_vth_ua[chg->current_code] / 1000);
+}
 
 /* One AUXADC conversion. Returns the 15-bit raw sample or a negative errno. */
 static int mt6323_auxadc_raw(struct mt6323_charger *chg, unsigned int ch,
@@ -204,6 +242,7 @@ static void mt6323_charger_enable(struct mt6323_charger *chg)
 	regmap_update_bits(r, MT6323_CHR_CON21, RG_CSDAC_STP_MASK, 0x1 << 4);
 	regmap_update_bits(r, MT6323_CHR_CON20, RG_CSDAC_STP_INC_MASK, 0x1 << 0);
 	regmap_update_bits(r, MT6323_CHR_CON20, RG_CSDAC_STP_DEC_MASK, 0x2 << 4);
+	mt6323_charger_assert_current(chg, true);
 	regmap_update_bits(r, MT6323_CHR_CON2, RG_CS_EN, RG_CS_EN);
 	regmap_update_bits(r, MT6323_CHR_CON23, RG_HWCV_EN, RG_HWCV_EN);
 	regmap_update_bits(r, MT6323_CHR_CON2, RG_VBAT_CV_EN, RG_VBAT_CV_EN);
@@ -229,7 +268,7 @@ static int mt6323_charger_hw_init(struct mt6323_charger *chg)
 	regmap_update_bits(r, MT6323_CHR_CON6, RG_VBAT_OV_VTH_MASK, RG_VBAT_OV_VTH_4_3V);
 	regmap_update_bits(r, MT6323_CHR_CON6, RG_VBAT_OV_EN, RG_VBAT_OV_EN);
 	regmap_update_bits(r, MT6323_CHR_CON3, RG_VBAT_CV_VTH_MASK, RG_VBAT_CV_VTH_4_2V);
-	regmap_update_bits(r, MT6323_CHR_CON4, RG_CS_VTH_MASK, RG_CS_VTH_450MA);
+	regmap_update_bits(r, MT6323_CHR_CON4, RG_CS_VTH_MASK, chg->current_code);
 
 	/*
 	 * Charger-port + battery detection (vendor charging_hw_init). Leaving these
@@ -260,7 +299,8 @@ static int mt6323_charger_hw_init(struct mt6323_charger *chg)
 	/* Enable the current source + hardware CV loop, then the charger. */
 	mt6323_charger_enable(chg);
 
-	dev_info(chg->dev, "MT6323 charger enabled (CV 4.2V, ~450mA, OVP 7V/4.3V)\n");
+	dev_info(chg->dev, "MT6323 charger enabled (CV 4.2V, ~%dmA, OVP 7V/4.3V)\n",
+		 mt6323_cs_vth_ua[chg->current_code] / 1000);
 	return 0;
 }
 
@@ -275,9 +315,10 @@ static void mt6323_charger_maint_work(struct work_struct *work)
 	uv = mt6323_vbat_uv(chg);
 	if (regmap_read(chg->regmap, MT6323_CHR_CON0, &con0)) {
 		chg->healthy_checks = 0;
-		if (recovery_1a)
-			regmap_update_bits(chg->regmap, MT6323_CHR_CON4,
-					   RG_CS_VTH_MASK, RG_CS_VTH_450MA);
+		if (recovery_1a) {
+			chg->current_code = RG_CS_VTH_450MA;
+			mt6323_charger_assert_current(chg, false);
+		}
 		goto reschedule;
 	}
 	if (recovery_1a) {
@@ -287,9 +328,10 @@ static void mt6323_charger_maint_work(struct work_struct *work)
 			chg->healthy_checks = 0;
 		}
 		chg->input_present = !!(con0 & RGS_CHRDET);
-		regmap_update_bits(chg->regmap, MT6323_CHR_CON4, RG_CS_VTH_MASK,
-			mt6323_recovery_current_code(&chg->healthy_checks, con0, uv));
+		chg->current_code =
+			mt6323_recovery_current_code(&chg->healthy_checks, con0, uv);
 	}
+	mt6323_charger_assert_current(chg, true);
 	/* Never interpret an ADC error as a depleted battery. */
 	if ((con0 & RGS_CHRDET) && !(con0 & RG_CHR_EN) &&
 	    uv >= 0 && uv < 4150000 &&
@@ -316,12 +358,7 @@ static int mt6323_charger_get_prop(struct power_supply *psy,
 		if (ret)
 			return ret;
 		/* Report the programmed limit, not a measured charging current. */
-		if ((con0 & RG_CS_VTH_MASK) == 0x6)
-			val->intval = 1000000;
-		else if ((con0 & RG_CS_VTH_MASK) == RG_CS_VTH_450MA)
-			val->intval = 450000;
-		else
-			return -ENODATA;
+		val->intval = mt6323_cs_vth_ua[con0 & RG_CS_VTH_MASK];
 		break;
 	case POWER_SUPPLY_PROP_ONLINE:
 		ret = regmap_read(chg->regmap, MT6323_CHR_CON0, &con0);
@@ -335,6 +372,44 @@ static int mt6323_charger_get_prop(struct power_supply *psy,
 	return 0;
 }
 
+/*
+ * Userspace picks the limit once it knows what the cable can give (a host port
+ * that enumerated us, a wall supply that did not). The largest table entry not
+ * above the request is programmed, capped at 1A; the recovery policy owns the
+ * code while recovery_1a is set.
+ */
+static int mt6323_charger_set_prop(struct power_supply *psy,
+				   enum power_supply_property psp,
+				   const union power_supply_propval *val)
+{
+	struct mt6323_charger *chg = power_supply_get_drvdata(psy);
+	unsigned int code;
+
+	if (psp != POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX)
+		return -EINVAL;
+	if (recovery_1a)
+		return -EBUSY;
+	if (val->intval < mt6323_cs_vth_ua[ARRAY_SIZE(mt6323_cs_vth_ua) - 1])
+		return -EINVAL;
+	for (code = CS_VTH_CODE_MAX_CURRENT; code < ARRAY_SIZE(mt6323_cs_vth_ua); code++)
+		if (mt6323_cs_vth_ua[code] <= val->intval)
+			break;
+	if (code == chg->current_code)
+		return 0;
+	chg->current_code = code;
+	mt6323_charger_assert_current(chg, false);
+	dev_info(chg->dev, "charge current limit set to %d mA\n",
+		 mt6323_cs_vth_ua[code] / 1000);
+	power_supply_changed(chg->psy);
+	return 0;
+}
+
+static int mt6323_charger_prop_is_writeable(struct power_supply *psy,
+					    enum power_supply_property psp)
+{
+	return psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX;
+}
+
 static enum power_supply_property mt6323_charger_props[] = {
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
 	POWER_SUPPLY_PROP_ONLINE,
@@ -346,6 +421,8 @@ static const struct power_supply_desc mt6323_charger_desc = {
 	.properties	= mt6323_charger_props,
 	.num_properties	= ARRAY_SIZE(mt6323_charger_props),
 	.get_property	= mt6323_charger_get_prop,
+	.set_property	= mt6323_charger_set_prop,
+	.property_is_writeable = mt6323_charger_prop_is_writeable,
 };
 
 static int mt6323_battery_get_prop(struct power_supply *psy,
@@ -418,6 +495,7 @@ static int mt6323_charger_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	chg->dev = &pdev->dev;
+	chg->current_code = RG_CS_VTH_450MA;
 	chg->regmap = dev_get_regmap(pdev->dev.parent, NULL);
 	if (!chg->regmap)
 		return dev_err_probe(&pdev->dev, -ENODEV, "no PMIC regmap\n");
