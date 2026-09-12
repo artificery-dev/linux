@@ -702,6 +702,19 @@ MODULE_AUTHOR(NIC_AUTHOR);
 MODULE_DESCRIPTION(NIC_DESC);
 MODULE_LICENSE("GPL");
 
+/*
+ * The address to start the firmware with when no WIFI NVRAM record supplies
+ * one. Without it the driver makes an address up from the system tick on
+ * every start, and the firmware cannot follow a change made later through
+ * the net_device (association is rejected), so the value has to be here
+ * before the function is powered on: the Wi-Fi power unit writes a
+ * machine-ID-derived address to /sys/module/wlan_mt/parameters/mac_override
+ * before it opens /dev/wmtWifi.
+ */
+static char *mac_override;
+module_param(mac_override, charp, 0644);
+MODULE_PARM_DESC(mac_override, "MAC address to start the firmware with when NVRAM has none");
+
 #define NIC_INF_NAME    "wlan%d" /* interface name */
 #define NIC_INF_NAME_FOR_AP_MODE "legacy%d"
 extern volatile int wlan_if_changed;
@@ -2990,6 +3003,19 @@ wlanProbe(
             // Load NVRAM content to REG_INFO_T
             glLoadNvram(prGlueInfo, prRegInfo);
 
+            /* The host's address wins over the tick-derived one, not over NVRAM. */
+            if (!prGlueInfo->fgNvramAvailable && mac_override && *mac_override) {
+                UINT_8 aucAddr[ETH_ALEN];
+
+                if (mac_pton(mac_override, aucAddr) && is_valid_ether_addr(aucAddr)) {
+                    COPY_MAC_ADDR(prGlueInfo->rMacAddrOverride, aucAddr);
+                    prGlueInfo->fgIsMacAddrOverride = TRUE;
+                    DBGLOG(INIT, INFO, ("MAC address from mac_override: "MACSTR"\n", MAC2STR(aucAddr)));
+                } else {
+                    DBGLOG(INIT, WARN, ("mac_override %s is not a usable address\n", mac_override));
+                }
+            }
+
             //kalMemCopy(&prGlueInfo->rRegInfo, prRegInfo, sizeof(REG_INFO_T));
 
             prRegInfo->u4PowerMode = CFG_INIT_POWER_SAVE_PROF;
@@ -3093,6 +3119,15 @@ bailout:
             } else {
                 eth_hw_addr_set(prGlueInfo->prDevHandler, MacAddr.sa_data);
                 memcpy(prGlueInfo->prDevHandler->perm_addr, prGlueInfo->prDevHandler->dev_addr, ETH_ALEN);
+                /*
+                 * Without a WIFI NVRAM record or mac_override the address is
+                 * the tick-derived one: on the Y2 it came up as
+                 * 00:08:22:33:b3:fb one boot and 00:08:22:33:b0:fb the next.
+                 * Say so; udev will try its persistent policy and fail, which
+                 * is the right complaint.
+                 */
+                if (!prGlueInfo->fgNvramAvailable && !prGlueInfo->fgIsMacAddrOverride)
+                    prGlueInfo->prDevHandler->addr_assign_type = NET_ADDR_RANDOM;
 
                 /* card is ready */
                 prGlueInfo->u4ReadyFlag = 1;
